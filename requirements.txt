@@ -1,0 +1,13 @@
+opencv-python
+numpy
+pillow
+pymupdf
+reportlab
+pyyaml
+pytest
+transformers>=4.21.0
+torch>=1.12.0
+python-docx
+openpyxl
+pdfplumber
+ollama
