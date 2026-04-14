@@ -165,10 +165,10 @@ class LibraryWindow(tk.Toplevel):
         list_frame.grid_rowconfigure(0, weight=1)
         list_frame.grid_columnconfigure(0, weight=1)
 
-        self.sym_list.heading("ref",   text="Reference")
-        self.sym_list.heading("title", text="Title")
-        self.sym_list.column("ref",   width=80,  minwidth=60)
-        self.sym_list.column("title", width=240, minwidth=80)
+        self.sym_list.heading("ref",   text="Reference", anchor="w")
+        self.sym_list.heading("title", text="Title", anchor="w")
+        self.sym_list.column("ref",   width=80,  minwidth=60, anchor="w")
+        self.sym_list.column("title", width=240, minwidth=80, anchor="w")
 
         self.sym_list.tag_configure("odd",  background="#1A2744")
         self.sym_list.tag_configure("even", background=COLORS["bg_card"])

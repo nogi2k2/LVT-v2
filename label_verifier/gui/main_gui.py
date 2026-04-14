@@ -27,13 +27,17 @@ from PIL import Image, ImageTk
 logger = logging.getLogger(__name__)
 
 try:
-    from app import (
+    from gui.theme import (
         COLORS, FONT_TITLE, FONT_HEADING, FONT_BODY, FONT_MONO, FONT_SMALL,
-        ProgressPopup, _lighten, APP_STATE, register_callback
+        ProgressPopup, lighten as _lighten,
+        contrast_text,
     )
+    from core.state_manager import APP_STATE, register_callback, unregister_callback
 except ImportError:
     APP_STATE = None
     def register_callback(event, fn): pass
+    def unregister_callback(event, fn): pass
+    def contrast_text(hex_color): return "#0F172A"
     COLORS = {
         # Philips light theme
         "bg":           "#F5F7FA",
@@ -53,6 +57,8 @@ except ImportError:
         "log_text":     "#1E3A5F",
         "sidebar":      "#0B2B5C",
         "sidebar_hover":"#0E3870",
+        "header_subtle":"#BFDBFE",
+        "header_faint": "#64748B",
     }
     FONT_TITLE   = ("Segoe UI", 16, "bold")
     FONT_HEADING = ("Segoe UI", 11, "bold")
@@ -64,6 +70,30 @@ except ImportError:
         h = h.lstrip("#")
         r, g, b = [int(h[i:i+2], 16) for i in (0, 2, 4)]
         return f"#{min(255,r+30):02x}{min(255,g+30):02x}{min(255,b+30):02x}"
+
+LABEL_LIGHT_COLORS = dict(COLORS)
+LABEL_DARK_COLORS = {
+    **LABEL_LIGHT_COLORS,
+    "bg":           "#0F172A",
+    "bg_card":      "#111827",
+    "bg_input":     "#0B1220",
+    "accent":       "#60A5FA",
+    "accent2":      "#22C55E",
+    "accent3":      "#F59E0B",
+    "danger":       "#F87171",
+    "text":         "#E5E7EB",
+    "text_muted":   "#94A3B8",
+    "border":       "#334155",
+    "header_bg":    "#1D4ED8",
+    "success":      "#4ADE80",
+    "warn":         "#FBBF24",
+    "log_bg":       "#0B1220",
+    "log_text":     "#E2E8F0",
+    "sidebar":      "#0F172A",
+    "sidebar_hover": "#1E293B",
+    "header_subtle": "#BFDBFE",
+    "header_faint":  "#93C5FD",
+}
 
 _ICON_LIBRARY_DIR = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -128,6 +158,12 @@ class MainGUI:
         """
         self.root  = root
         self._mode = mode
+        self._theme_name = "light"
+        self._main_nb_style = f"LabelMain{abs(id(self))}.TNotebook"
+        self._sub_nb_style = f"LabelSub{abs(id(self))}.TNotebook"
+        self._batch_pb_style = f"LabelBatch{abs(id(self))}.Horizontal.TProgressbar"
+        self._ifu_pb_style = f"LabelIFU{abs(id(self))}.Horizontal.TProgressbar"
+        self._sync_theme_palette()
 
         _titles = {
             "label": "Label Verification — EVO MDD",
@@ -156,6 +192,8 @@ class MainGUI:
 
         # StringVar bound to the entry widget — shows path or "N files selected"
         self._label_path_display = tk.StringVar()
+        self._preview_index = -1
+        self._preview_total_var = tk.StringVar(value="No label image loaded.")
 
         self._icon_dir    = tk.StringVar(value=_ICON_LIBRARY_DIR)
         self._config_path = tk.StringVar(
@@ -163,6 +201,7 @@ class MainGUI:
         )
         self._status_var  = tk.StringVar(value="Ready.")
         self._results     = []
+        self._label_result_sections = []
         self._photo_cache = []
         self._running     = False
 
@@ -206,7 +245,252 @@ class MainGUI:
 
         self._build_ui()
         self._center()
+        self.root.bind("<Destroy>", self._on_destroy, add="+")
         self._wire_automations()
+
+    def _colors(self) -> dict:
+        return LABEL_LIGHT_COLORS if self._theme_name == "light" else LABEL_DARK_COLORS
+
+    def _sync_theme_palette(self):
+        global COLORS
+        COLORS = dict(self._colors())
+        self.HEADER_BG = COLORS["header_bg"]
+        self.ACCENT = COLORS["accent"]
+
+    def _theme_button_label(self) -> str:
+        return "☀ Light" if self._theme_name == "dark" else "☾ Dark"
+
+    def _toggle_theme(self):
+        snapshot = self._capture_theme_state()
+        self._theme_name = "dark" if self._theme_name == "light" else "light"
+        self._sync_theme_palette()
+        self._rebuild_for_theme(snapshot)
+
+    def _capture_theme_state(self) -> dict:
+        log_content = ""
+        try:
+            log_content = self.log_text.get("1.0", "end-1c")
+        except Exception:
+            pass
+
+        ifu_states = []
+        for card in getattr(self, "_ifu_cards", []):
+            try:
+                ifu_states.append({
+                    "prd_id": getattr(card.get("prd"), "prd_id", ""),
+                    "verdict": card["verdict_var"].get(),
+                    "verdict_text": card["verdict_lbl"].cget("text"),
+                    "score": card["score_var"].get(),
+                    "progress": float(card["prog_bar"].cget("value")),
+                    "progress_label": card["prog_lbl_var"].get(),
+                    "results_text": card["results_text"].get("1.0", "end-1c"),
+                    "notes": card["notes_text"].get("1.0", "end-1c") if card.get("notes_text") else "",
+                    "hits": list(card.get("hits", [])),
+                })
+            except Exception:
+                pass
+
+        return {
+            "label_paths": list(self._label_paths),
+            "preview_index": self._preview_index,
+            "icon_dir": self._icon_dir.get(),
+            "config_path": self._config_path.get(),
+            "status": self._status_var.get(),
+            "file_count": self._file_count_var.get(),
+            "batch_label": self._batch_lbl_var.get(),
+            "progress": self._pb_var.get(),
+            "batch_total": self._batch_total,
+            "batch_found": self._batch_found,
+            "batch_missing": self._batch_missing,
+            "running": self._running,
+            "selected_icons": {name for name, var in zip(self._icon_list_names, self._icon_check_vars) if var.get()},
+            "config_visible": bool(getattr(self, "_config_visible", tk.BooleanVar(value=False)).get()),
+            "log_visible": bool(getattr(self, "_log_visible", tk.BooleanVar(value=False)).get()),
+            "log_content": log_content,
+            "vv_plan_path": self._vv_plan_path.get(),
+            "vv_plan_data": self._vv_plan_data,
+            "required_symbols": [dict(s) for s in self._required_symbols],
+            "labels_summary": self._labels_var.get() if hasattr(self, "_labels_var") else "—",
+            "total_summary": self._total_var.get() if hasattr(self, "_total_var") else "—",
+            "found_summary": self._found_var.get() if hasattr(self, "_found_var") else "—",
+            "missing_summary": self._missing_var.get() if hasattr(self, "_missing_var") else "—",
+            "verdict": self._verdict_var.get() if hasattr(self, "_verdict_var") else "—",
+            "result_sections": list(self._label_result_sections),
+            "ifu_shared": self._ifu_shared_var.get(),
+            "ifu_summary": self._ifu_summary_var.get(),
+            "ifu_complete": self._ifu_complete_var.get(),
+            "ifu_states": ifu_states,
+        }
+
+    def _restore_label_selection_display(self):
+        paths = self._label_paths
+        n = len(paths)
+        if n == 0:
+            self._label_path_display.set("")
+            self._file_count_var.set("")
+        elif n == 1:
+            self._label_path_display.set(paths[0])
+            self._file_count_var.set("")
+        else:
+            self._label_path_display.set(f"{n} files selected")
+            names = ", ".join(os.path.basename(p) for p in paths[:3])
+            suffix = f"  … +{n - 3} more" if n > 3 else ""
+            self._file_count_var.set(f"  {names}{suffix}")
+
+    def _restore_result_sections(self, sections: list):
+        self._clear_results()
+        self._label_result_sections = []
+        for section in sections:
+            if section.get("type") == "result":
+                self._append_label_section(
+                    section["fname"],
+                    section["symbols"],
+                    section["passed"],
+                    section["num"],
+                    section["total"],
+                    record_state=False,
+                )
+            elif section.get("type") == "error":
+                self._append_error_section(
+                    section["fname"],
+                    section["message"],
+                    section["num"],
+                    section["total"],
+                    record_state=False,
+                )
+        self._label_result_sections = list(sections)
+
+    def _restore_ifu_card_states(self, ifu_states: list):
+        if not ifu_states:
+            return
+        state_by_prd = {s.get("prd_id"): s for s in ifu_states}
+        for card in self._ifu_cards:
+            prd_id = getattr(card.get("prd"), "prd_id", "")
+            state = state_by_prd.get(prd_id)
+            if not state:
+                continue
+            card["verdict_var"].set(state.get("verdict", "PENDING"))
+            verdict_text = state.get("verdict_text", "Pending")
+            verdict = state.get("verdict", "PENDING")
+            verdict_color = COLORS["text_muted"]
+            if verdict == "PASS":
+                verdict_color = COLORS["success"]
+            elif verdict == "FAIL":
+                verdict_color = COLORS["danger"]
+            elif verdict in ("REVIEW", "MANUAL"):
+                verdict_color = COLORS["warn"]
+            card["verdict_lbl"].configure(text=verdict_text, fg=verdict_color)
+            card["score_var"].set(state.get("score", ""))
+            card["prog_lbl_var"].set(state.get("progress_label", ""))
+            card["prog_bar"]["value"] = state.get("progress", 0)
+            rt = card.get("results_text")
+            if rt:
+                rt.configure(state="normal")
+                rt.delete("1.0", "end")
+                rt.insert("end", state.get("results_text", ""))
+                rt.configure(state="disabled")
+            if card.get("notes_text"):
+                card["notes_text"].delete("1.0", "end")
+                card["notes_text"].insert("1.0", state.get("notes", ""))
+            card["hits"] = list(state.get("hits", []))
+
+    def _rebuild_for_theme(self, snapshot: dict):
+        for child in self.root.winfo_children():
+            child.destroy()
+        self._photo_cache = []
+        self._cards = [] if hasattr(self, "_cards") else []
+        self._ifu_cards = []
+        self.root.configure(bg=COLORS["bg"])
+        self._build_ui()
+
+        self._icon_dir.set(snapshot["icon_dir"])
+        self._config_path.set(snapshot["config_path"])
+        self._status_var.set(snapshot["status"])
+        self._label_paths = list(snapshot["label_paths"])
+        self._preview_index = snapshot["preview_index"]
+        self._batch_lbl_var.set(snapshot["batch_label"])
+        self._pb_var.set(snapshot["progress"])
+        self._batch_total = snapshot["batch_total"]
+        self._batch_found = snapshot["batch_found"]
+        self._batch_missing = snapshot["batch_missing"]
+        self._running = snapshot["running"]
+        self._vv_plan_data = snapshot["vv_plan_data"]
+        self._required_symbols = list(snapshot["required_symbols"])
+        self._ifu_shared_var.set(snapshot["ifu_shared"])
+        self._ifu_summary_var.set(snapshot["ifu_summary"])
+        self._ifu_complete_var.set(snapshot["ifu_complete"])
+
+        self._restore_label_selection_display()
+
+        if self._mode == "label":
+            selected = snapshot["selected_icons"]
+            for name, var in zip(self._icon_list_names, self._icon_check_vars):
+                var.set(name in selected)
+
+        if snapshot["config_visible"] and not self._config_visible.get():
+            self._toggle_config()
+        if snapshot["log_visible"] and not self._log_visible.get():
+            self._toggle_logs()
+
+        if snapshot["log_content"]:
+            self.log_text.configure(state="normal")
+            self.log_text.delete("1.0", "end")
+            self.log_text.insert("1.0", snapshot["log_content"])
+            self.log_text.configure(state="disabled")
+
+        if snapshot["vv_plan_data"] is not None:
+            self._apply_vv_plan_from_state(snapshot["vv_plan_path"], snapshot["vv_plan_data"])
+
+        if snapshot["result_sections"]:
+            self._restore_result_sections(snapshot["result_sections"])
+
+        if hasattr(self, "_labels_var"):
+            self._labels_var.set(snapshot["labels_summary"])
+            self._total_var.set(snapshot["total_summary"])
+            self._found_var.set(snapshot["found_summary"])
+            self._missing_var.set(snapshot["missing_summary"])
+            self._verdict_var.set(snapshot["verdict"])
+            if "PASS" in snapshot["verdict"]:
+                self._verdict_lbl.configure(fg=COLORS["success"])
+            elif "FAIL" in snapshot["verdict"] or "ERROR" in snapshot["verdict"]:
+                self._verdict_lbl.configure(fg=COLORS["danger"])
+            else:
+                self._verdict_lbl.configure(fg=COLORS["text_muted"])
+
+        if self._label_paths:
+            self._load_current_label_preview()
+
+        self._restore_ifu_card_states(snapshot["ifu_states"])
+        self._refresh_text_tags()
+
+    def _configure_ttk_styles(self):
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure(self._main_nb_style, background=COLORS["bg"], borderwidth=0)
+        style.configure(f"{self._main_nb_style}.Tab", background=COLORS["bg_card"], foreground=COLORS["text_muted"], padding=[12, 6], font=FONT_BODY)
+        style.map(f"{self._main_nb_style}.Tab", background=[("selected", COLORS["accent"])], foreground=[("selected", contrast_text(COLORS["accent"]))])
+        style.configure(self._sub_nb_style, background=COLORS["bg"], borderwidth=0)
+        style.configure(f"{self._sub_nb_style}.Tab", background=COLORS["bg"], foreground=COLORS["text_muted"], padding=[10, 5], font=FONT_SMALL)
+        style.map(f"{self._sub_nb_style}.Tab", background=[("selected", COLORS["bg_card"])], foreground=[("selected", COLORS["accent"])])
+        for pb_style in (self._batch_pb_style, self._ifu_pb_style):
+            style.configure(pb_style, troughcolor=COLORS["bg_card"], background=COLORS["accent"], bordercolor=COLORS["border"], lightcolor=COLORS["accent"], darkcolor=COLORS["accent"])
+
+    def _refresh_text_tags(self):
+        if hasattr(self, "log_text") and self.log_text.winfo_exists():
+            self.log_text.tag_configure("INFO", foreground=COLORS["log_text"])
+            self.log_text.tag_configure("WARN", foreground=COLORS["warn"])
+            self.log_text.tag_configure("ERROR", foreground=COLORS["danger"])
+            self.log_text.tag_configure("OK", foreground=COLORS["success"])
+        for card in getattr(self, "_ifu_cards", []):
+            rt = card.get("results_text")
+            if rt and rt.winfo_exists():
+                rt.tag_config("found", foreground=COLORS["success"])
+                rt.tag_config("missing", foreground=COLORS["danger"])
+                rt.tag_config("page", foreground=COLORS["accent"])
+                rt.tag_config("section", foreground=COLORS["accent3"])
 
     # ── Event bus wiring ──────────────────────────────────────────────────
 
@@ -233,6 +517,8 @@ class MainGUI:
 
     def _on_vv_plan_ready(self, data):
         """Called via event bus when the home screen loads a new V&V Plan."""
+        if not self.root.winfo_exists():
+            return
         path = APP_STATE.get("vv_plan_path", "") if APP_STATE else ""
         self.root.after(0, self._apply_vv_plan_from_state, path, data)
 
@@ -316,16 +602,39 @@ class MainGUI:
         hdr = tk.Frame(self.root, bg=self.HEADER_BG, padx=20, pady=14)
         hdr.grid(row=0, column=0, sticky="ew")
         hdr.columnconfigure(1, weight=1)
+        hdr.columnconfigure(3, weight=0)
 
         tk.Label(hdr, text="EVO MDD Verification Tool",
                  bg=self.HEADER_BG, fg="white",
                  font=FONT_TITLE).grid(row=0, column=0, sticky="w")
         tk.Label(hdr, text="  ·  Automated medical symbol verification",
-                 bg=self.HEADER_BG, fg="#93C5FD",
+                 bg=self.HEADER_BG, fg=COLORS["header_subtle"],
                  font=FONT_BODY).grid(row=0, column=1, sticky="w")
         tk.Label(hdr, text="EVO MDD Verification Tool",
-                 bg=self.HEADER_BG, fg="#64748B",
+                 bg=self.HEADER_BG, fg=COLORS["header_faint"],
                  font=FONT_SMALL).grid(row=0, column=2, sticky="e")
+        self._theme_btn = tk.Button(
+            hdr,
+            text=self._theme_button_label(),
+            command=self._toggle_theme,
+            bg=self.HEADER_BG,
+            fg="white",
+            activebackground=_lighten(self.HEADER_BG),
+            activeforeground="white",
+            relief="flat",
+            cursor="hand2",
+            font=FONT_SMALL,
+            padx=10,
+            pady=4,
+            bd=0,
+        )
+        self._theme_btn.grid(row=0, column=3, sticky="e", padx=(12, 0))
+
+    def _on_destroy(self, event):
+        if event.widget is self.root:
+            unregister_callback("icon_library_ready", self._on_icon_library_ready)
+            unregister_callback("symbols_ready", self._on_symbols_ready)
+            unregister_callback("vv_plan_ready", self._on_vv_plan_ready)
 
     def _build_main(self):
         pane = tk.PanedWindow(
@@ -460,8 +769,8 @@ class MainGUI:
 
         self._sel_rec_btn = tk.Button(
             btn_row, text="★ Required Symbols", command=_select_recommended,
-            bg=COLORS["accent3"], fg="#0F172A",
-            activebackground=COLORS["accent3"], activeforeground="#0F172A",
+            bg=COLORS["accent3"], fg=contrast_text(COLORS["accent3"]),
+            activebackground=COLORS["accent3"], activeforeground=contrast_text(COLORS["accent3"]),
             relief="flat", cursor="hand2",
             font=("Segoe UI", 8, "bold"), padx=4, pady=3, bd=0,
             highlightthickness=1, highlightbackground=COLORS["accent3"],
@@ -522,12 +831,22 @@ class MainGUI:
         )
         self._icon_list_placeholder.pack(pady=16)
 
-        # ── Configuration ─────────────────────────────────────────────
-        row = self._section_header(frame, "Configuration", row, top=4)
-        row = self._path_row(frame, "Verification Configuration", self._config_path,
-                             "Select Config File",
-                             [("INI files", "*.ini *.cfg"), ("All files", "*.*")],
-                             is_dir=False, row=row)
+        # ── Configuration (Hidden by default) ─────────────────────────
+        self._config_visible = tk.BooleanVar(value=False)
+        self._config_toggle_btn = tk.Button(
+            frame, text="▶ Advanced Configuration", command=self._toggle_config,
+            bg=COLORS["bg"], fg=COLORS["text_muted"], activebackground=COLORS["border"],
+            relief="flat", cursor="hand2", font=FONT_SMALL, anchor="w", bd=0
+        )
+        self._config_toggle_btn.grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 2))
+        row += 1
+
+        self.config_frame = tk.Frame(frame, bg=COLORS["bg"])
+        self._config_frame_row = row
+        
+        self._path_row(self.config_frame, "Verification Configuration (.ini)", self._config_path,
+                       "Select Config File", [("INI files", "*.ini *.cfg"), ("All files", "*.*")], False, 0)
+        row += 1
 
         # ── Run button ────────────────────────────────────────────────
         self._verify_btn = tk.Button(
@@ -555,46 +874,48 @@ class MainGUI:
         row += 1
 
         # ── Determinate progress bar ──────────────────────────────────
-        style = ttk.Style()
-        style.configure("Batch.Horizontal.TProgressbar",
-                        troughcolor=COLORS["bg_card"],
-                        background=COLORS["accent"],
-                        bordercolor=COLORS["border"],
-                        lightcolor=COLORS["accent"],
-                        darkcolor=COLORS["accent"])
+        self._configure_ttk_styles()
 
         self._mini_pb = ttk.Progressbar(
             frame, mode="determinate",
             variable=self._pb_var, maximum=100.0,
-            style="Batch.Horizontal.TProgressbar",
+            style=self._batch_pb_style,
         )
         self._mini_pb.grid(row=row, column=0, columnspan=3,
                            sticky="ew", pady=(2, 10))
         row += 1
 
         # ── Log ───────────────────────────────────────────────────────
-        tk.Label(frame, text="Log", bg=COLORS["bg"],
-                 fg=COLORS["text_muted"], font=FONT_SMALL,
-                 anchor="w").grid(row=row, column=0, columnspan=3, sticky="w")
+        # ── Collapsible Log Area ──────────────────────────────────────
+        self._log_visible = tk.BooleanVar(value=False)
+        log_toggle_btn = tk.Button(
+            frame, text="▼ Show Logs",
+            command=self._toggle_logs,
+            bg=COLORS["bg"], fg=COLORS["text_muted"],
+            activebackground=COLORS["border"], relief="flat",
+            cursor="hand2", font=FONT_SMALL, anchor="w", bd=0
+        )
+        log_toggle_btn.grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self._log_toggle_btn = log_toggle_btn
         row += 1
 
-        log_frame = tk.Frame(frame, bg=COLORS["log_bg"],
-                             highlightthickness=1,
-                             highlightbackground=COLORS["border"])
-        log_frame.grid(row=row, column=0, columnspan=3, sticky="nsew")
-        log_frame.rowconfigure(0, weight=1)
-        log_frame.columnconfigure(0, weight=1)
+        self.log_frame = tk.Frame(frame, bg=COLORS["log_bg"],
+                             highlightthickness=1, highlightbackground=COLORS["border"])
+        # Do not grid it initially (it starts hidden)
+        self.log_frame.rowconfigure(0, weight=1)
+        self.log_frame.columnconfigure(0, weight=1)
+        
+        # Save the row index so we can grid it later
+        self._log_frame_row = row 
         frame.rowconfigure(row, weight=1)
-        row += 1
 
         self.log_text = tk.Text(
-            log_frame, wrap="word", state="disabled",
+            self.log_frame, wrap="word", state="disabled",
             bg=COLORS["log_bg"], fg=COLORS["log_text"],
             font=FONT_MONO, relief="flat", padx=6, pady=4,
             insertbackground=COLORS["text"], selectbackground=COLORS["accent"],
         )
-        log_sb = tk.Scrollbar(log_frame, command=self.log_text.yview,
-                              bg=COLORS["bg_card"], troughcolor=COLORS["bg"])
+        log_sb = tk.Scrollbar(self.log_frame, command=self.log_text.yview, bg=COLORS["bg_card"], troughcolor=COLORS["bg"])
         self.log_text.configure(yscrollcommand=log_sb.set)
         self.log_text.grid(row=0, column=0, sticky="nsew")
         log_sb.grid(row=0, column=1, sticky="ns")
@@ -605,6 +926,28 @@ class MainGUI:
         self.log_text.tag_configure("OK",    foreground=COLORS["success"])
 
         return frame
+
+    def _toggle_logs(self):
+        """Toggle visibility of the bottom log area."""
+        if self._log_visible.get():
+            self.log_frame.grid_remove()
+            self._log_toggle_btn.configure(text="▼ Show Logs")
+            self._log_visible.set(False)
+        else:
+            self.log_frame.grid(row=self._log_frame_row, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
+            self._log_toggle_btn.configure(text="▲ Hide Logs")
+            self._log_visible.set(True)
+
+    def _toggle_config(self):
+        """Toggle visibility of the advanced configuration picker."""
+        if self._config_visible.get():
+            self.config_frame.grid_remove()
+            self._config_toggle_btn.configure(text="▶ Advanced Configuration")
+            self._config_visible.set(False)
+        else:
+            self.config_frame.grid(row=self._config_frame_row, column=0, columnspan=3, sticky="ew")
+            self._config_toggle_btn.configure(text="▼ Advanced Configuration")
+            self._config_visible.set(True)
 
 
     def _refocus(self):
@@ -636,7 +979,7 @@ class MainGUI:
             if _root not in sys.path:
                 sys.path.insert(0, _root)
 
-            from vv_plan_parser import parse_vv_plan
+            from parsers.vv_plan_parser import parse_vv_plan
             data = parse_vv_plan(p)
 
             if data.raw_error:
@@ -695,7 +1038,9 @@ class MainGUI:
 
     def _apply_vv_plan_from_state(self, path: str, data):
         """Apply a V&V Plan already parsed and stored in APP_STATE."""
-        if data is None:
+        if data is None or not self.root.winfo_exists():
+            return
+        if not hasattr(self, "_vv_tab_inner") or self._vv_tab_inner is None or not self._vv_tab_inner.winfo_exists():
             return
         self._vv_plan_data = data
         self._vv_plan_path.set(path)
@@ -762,20 +1107,15 @@ class MainGUI:
         card["prog_lbl_var"].set(label)
 
     def _ifu_verify_single(self, card: dict):
-        import sys, os as _os, threading as _th
-        _root_dir = _os.path.normpath(
-            _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", ".."))
-        if _root_dir not in sys.path:
-            sys.path.insert(0, _root_dir)
-        from ifu_verifier_window import (extract_pdf_text, detect_sections,
-                                         search_ifu_for_keywords,
-                                         compute_verdict_suggestion)
+        import threading as _th
+        from ifu_verifier.controller import IFUController
+        
         ifu_path = self._ifu_shared_var.get()
-        if not ifu_path or not _os.path.isfile(ifu_path):
+        if not ifu_path or not os.path.isfile(ifu_path):
             return
 
         prd = card["prd"]
-        self._log(f"Verifying {prd.prd_id} — {_os.path.basename(ifu_path)}…")
+        self._log(f"Verifying {prd.prd_id} — {os.path.basename(ifu_path)}…")
 
         rt = card["results_text"]
         rt.configure(state="normal"); rt.delete("1.0", "end")
@@ -783,57 +1123,18 @@ class MainGUI:
         rt.configure(state="disabled")
         card["score_var"].set("Working…")
         self.root.after(0, self._ifu_set_progress, card, 0, "Reading PDF…")
-        self.root.update_idletasks()
 
-        # ── Phase 1: extraction progress (0 → 50%) ────────────────────
-        def _extract_cb(cur, total):
-            pct = int(cur / total * 45) if total > 0 else 0   # 0-45%
-            self.root.after(0, self._ifu_set_progress, card, pct,
-                            f"📄  Extracting page {cur} of {total}…")
-
-        # ── Phase 2: search progress (50 → 100%) ─────────────────────
-        def _search_cb(cur, total, found, n_kw):
-            remaining = n_kw - found
-            pct = 50 + int(cur / total * 50) if total > 0 else 50
-            status = (f"🔍  Searching page {cur}/{total}  ·  "
-                      f"{found}/{n_kw} keywords found")
-            if remaining > 0:
-                status += f"  ·  {remaining} still pending…"
-            else:
-                status += "  ·  All found — stopping early!"
-            self.root.after(0, self._ifu_set_progress, card, pct, status)
+        def _progress_cb(pct, label):
+            self.root.after(0, self._ifu_set_progress, card, pct, label)
 
         def _run():
             try:
-                # Phase 1 — extract
-                self.root.after(0, self._ifu_set_progress, card, 2,
-                                "📄  Opening PDF…")
-                pages = extract_pdf_text(ifu_path, page_callback=_extract_cb)
-                if not pages:
-                    self.root.after(0, self._ifu_show_error, card,
-                                    f"Could not extract text from "
-                                    f"{_os.path.basename(ifu_path)}")
-                    return
-
-                # Phase 1.5 — section detection
-                self.root.after(0, self._ifu_set_progress, card, 48,
-                                "🔎  Detecting document sections…")
-                secs = detect_sections(pages)
-
-                # Phase 2 — keyword search
-                self.root.after(0, self._ifu_set_progress, card, 50,
-                                f"🔍  Searching {len(pages)} pages…")
-                hits = search_ifu_for_keywords(
-                    pages, card["keywords"], progress_callback=_search_cb)
-
-                v, sc, reason = compute_verdict_suggestion(
-                    hits, secs, card["req_sections"], 0.75)
-                self.root.after(0, self._ifu_show_result,
-                                card, hits, secs, v, sc, reason)
+                res = IFUController.verify_prd(ifu_path, card["keywords"], card["req_sections"], _progress_cb)
+                self.root.after(0, self._ifu_show_result, card, res["hits"], res["sections"], res["verdict"], res["score"], res["reason"])
             except Exception as e:
                 import traceback
-                self.root.after(0, self._log,
-                                f"IFU error: {e}\n{traceback.format_exc()}", "ERROR")
+                self.root.after(0, self._ifu_show_error, card, str(e))
+                self.root.after(0, self._log, f"IFU error: {e}\n{traceback.format_exc()}", "ERROR")
 
         _th.Thread(target=_run, daemon=True).start()
 
@@ -952,7 +1253,7 @@ class MainGUI:
             _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", ".."))
         if _root_dir not in sys.path:
             sys.path.insert(0, _root_dir)
-        from ifu_verifier_window import build_pdf_report
+        from ifu_verifier.ifu_verifier_window import build_pdf_report
         ifu_path = self._ifu_shared_var.get()
         result = build_pdf_report(self._ifu_cards, self._vv_plan_data, path,
                                   ifu_pdf_path=ifu_path)
@@ -984,7 +1285,71 @@ class MainGUI:
             names = ", ".join(os.path.basename(p) for p in paths[:3])
             suffix = f"  … +{n - 3} more" if n > 3 else ""
             self._file_count_var.set(f"  {names}{suffix}")
+        self._preview_index = 0
+        self._load_current_label_preview()
         self._refocus()
+
+    def _scroll_canvas_vertical(self, canvas: tk.Canvas, event):
+        delta = getattr(event, "delta", 0)
+        if delta:
+            step = -1 * int(delta / 120) if delta % 120 == 0 else (-1 if delta > 0 else 1)
+            canvas.yview_scroll(step, "units")
+            return "break"
+        num = getattr(event, "num", None)
+        if num == 4:
+            canvas.yview_scroll(-1, "units")
+            return "break"
+        if num == 5:
+            canvas.yview_scroll(1, "units")
+            return "break"
+        return None
+
+    def _scroll_canvas_horizontal(self, canvas: tk.Canvas, event):
+        delta = getattr(event, "delta", 0)
+        if delta:
+            step = -1 * int(delta / 120) if delta % 120 == 0 else (-1 if delta > 0 else 1)
+            canvas.xview_scroll(step, "units")
+            return "break"
+        num = getattr(event, "num", None)
+        if num == 4:
+            canvas.xview_scroll(-1, "units")
+            return "break"
+        if num == 5:
+            canvas.xview_scroll(1, "units")
+            return "break"
+        return None
+
+    def _bind_canvas_hover_scroll(self, canvas: tk.Canvas):
+        canvas.bind("<MouseWheel>", lambda e, c=canvas: self._scroll_canvas_vertical(c, e))
+        canvas.bind("<Shift-MouseWheel>", lambda e, c=canvas: self._scroll_canvas_horizontal(c, e))
+        canvas.bind("<Button-4>", lambda e, c=canvas: self._scroll_canvas_vertical(c, e))
+        canvas.bind("<Button-5>", lambda e, c=canvas: self._scroll_canvas_vertical(c, e))
+        canvas.bind("<Shift-Button-4>", lambda e, c=canvas: self._scroll_canvas_horizontal(c, e))
+        canvas.bind("<Shift-Button-5>", lambda e, c=canvas: self._scroll_canvas_horizontal(c, e))
+
+    def _set_preview_index(self, index: int):
+        if not self._label_paths:
+            self._preview_index = -1
+            return
+        self._preview_index = max(0, min(index, len(self._label_paths) - 1))
+        self._load_current_label_preview()
+
+    def _preview_prev_label(self):
+        if self._label_paths:
+            self._set_preview_index(self._preview_index - 1)
+
+    def _preview_next_label(self):
+        if self._label_paths:
+            self._set_preview_index(self._preview_index + 1)
+
+    def _load_current_label_preview(self):
+        if not self._label_paths:
+            self._preview_total_var.set("No label image loaded.")
+            return
+        if self._preview_index < 0:
+            self._preview_index = 0
+        self._load_label_preview(self._label_paths[self._preview_index])
+
     def _get_required_name_set(self) -> set:
         """Return a lower-case set of required symbol names from the V&V Plan."""
         return {s["symbol"].lower() for s in self._required_symbols
@@ -1095,7 +1460,7 @@ class MainGUI:
             if is_req:
                 tk.Label(
                     row_frame, text="★ Required",
-                    bg=COLORS["accent3"], fg="#0F172A",
+                    bg=COLORS["accent3"], fg=contrast_text(COLORS["accent3"]),
                     font=("Segoe UI", 7, "bold"),
                     padx=5, pady=1,
                 ).pack(side="right", padx=(2, 4))
@@ -1197,19 +1562,9 @@ class MainGUI:
         nb_frame.rowconfigure(0, weight=1)
         nb_frame.columnconfigure(0, weight=1)
 
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("Dark.TNotebook",
-                         background=COLORS["bg"], borderwidth=0)
-        style.configure("Dark.TNotebook.Tab",
-                         background=COLORS["bg_card"],
-                         foreground=COLORS["text_muted"],
-                         padding=[12, 6], font=FONT_BODY)
-        style.map("Dark.TNotebook.Tab",
-                  background=[("selected", COLORS["accent"])],
-                  foreground=[("selected", "white")])
+        self._configure_ttk_styles()
 
-        self._nb = ttk.Notebook(nb_frame, style="Dark.TNotebook")
+        self._nb = ttk.Notebook(nb_frame, style=self._main_nb_style)
         self._nb.grid(row=0, column=0, sticky="nsew")
 
         # Hidden frame for stub widgets that are never displayed
@@ -1300,38 +1655,58 @@ class MainGUI:
             h.pack(fill="x", padx=12, pady=(12,0))
             tk.Label(h, text=title, bg=color, fg="white",
                      font=FONT_HEADING, padx=10, pady=5).pack(anchor="w")
-        def _row(vals, header=False, bg=COLORS["bg_card"]):
-            widths = [200, 80, 480, 100]
-            rf = tk.Frame(self._vv_tab_inner, bg=bg,
-                          highlightthickness=1,
-                          highlightbackground=COLORS["border"])
-            rf.pack(fill="x", padx=12)
-            fnt = (FONT_SMALL[0], FONT_SMALL[1], "bold") if header else FONT_SMALL
-            hdr_bg = COLORS["header_bg"] if header else bg
-            for v, w in zip(vals, widths):
-                tk.Label(rf, text=str(v), bg=hdr_bg,
-                         fg="white" if header else COLORS["text"],
-                         font=fnt, anchor="w", width=w//7,
-                         wraplength=w, justify="left",
-                         padx=6, pady=4).pack(side="left")
+        def _table(rows, headers):
+            widths = [140, 150, 520, 180]
+            tbl = tk.Frame(self._vv_tab_inner, bg=COLORS["border"],
+                           highlightthickness=1,
+                           highlightbackground=COLORS["border"])
+            tbl.pack(fill="x", padx=12)
+
+            for col_idx, width in enumerate(widths):
+                tbl.grid_columnconfigure(col_idx, minsize=width, weight=0)
+            tbl.grid_columnconfigure(len(widths) - 1, weight=1)
+
+            def _cell(row_idx, col_idx, value, *, header=False, bg=COLORS["bg_card"]):
+                cell_bg = COLORS["header_bg"] if header else bg
+                cell = tk.Frame(tbl, bg=cell_bg)
+                cell.grid(row=row_idx, column=col_idx, sticky="nsew")
+                if col_idx < len(widths) - 1:
+                    tk.Frame(cell, bg=COLORS["border"], width=1).pack(side="right", fill="y")
+                tk.Label(
+                    cell,
+                    text=str(value),
+                    bg=cell_bg,
+                    fg="white" if header else COLORS["text"],
+                    font=(FONT_SMALL[0], FONT_SMALL[1], "bold") if header else FONT_SMALL,
+                    anchor="w",
+                    justify="left",
+                    wraplength=max(widths[col_idx] - 14, 80),
+                    padx=6,
+                    pady=6,
+                ).pack(fill="both", expand=True)
+
+            for col_idx, title in enumerate(headers):
+                _cell(0, col_idx, title, header=True)
+
+            row_colors = [COLORS["bg_card"], COLORS["bg"]]
+            for row_idx, values in enumerate(rows, start=1):
+                bg = row_colors[(row_idx - 1) % len(row_colors)]
+                for col_idx, value in enumerate(values):
+                    _cell(row_idx, col_idx, value, bg=bg)
         if data.label_prds:
             _sec("Label Verification PRDs (" + str(len(data.label_prds)) + ")",
                  COLORS["accent"])
-            _row(["PRD ID","Method","Requirement Text","Symbols"], header=True)
-            for i, e in enumerate(data.label_prds):
-                _row([e.prd_id, e.vv_method,
-                      e.requirement_text[:200],
-                      ", ".join(e.symbols) or "-"],
-                     bg=COLORS["bg_card"] if i%2==0 else COLORS["bg"])
+            _table([
+                [e.prd_id, e.vv_method, e.requirement_text[:200], ", ".join(e.symbols) or "-"]
+                for e in data.label_prds
+            ], ["PRD ID", "Method", "Requirement Text", "Symbols"])
         if data.ifu_prds:
             _sec("IFU Verification PRDs (" + str(len(data.ifu_prds)) + ")",
                  COLORS["accent3"])
-            _row(["PRD ID","Method","Requirement Text","Type"], header=True)
-            for i, e in enumerate(data.ifu_prds):
-                _row([e.prd_id, e.vv_method,
-                      e.requirement_text[:200],
-                      e.verification_type],
-                     bg=COLORS["bg_card"] if i%2==0 else COLORS["bg"])
+            _table([
+                [e.prd_id, e.vv_method, e.requirement_text[:200], e.verification_type]
+                for e in data.ifu_prds
+            ], ["PRD ID", "Method", "Requirement Text", "Type"])
         nt = tk.Frame(self._vv_tab_inner, bg=COLORS["bg_card"],
                       highlightthickness=1, highlightbackground=COLORS["border"])
         nt.pack(fill="x", padx=12, pady=(14,10))
@@ -1373,23 +1748,14 @@ class MainGUI:
                  font=FONT_HEADING).pack(side="left", padx=(0, 24))
 
         # Sub-notebook (Required Symbols | Label Results | Label Preview)
-        style = ttk.Style()
-        style.configure("Sub.TNotebook",
-                        background=COLORS["bg"], borderwidth=0)
-        style.configure("Sub.TNotebook.Tab",
-                        background=COLORS["bg"],
-                        foreground=COLORS["text_muted"],
-                        padding=[10, 5], font=FONT_SMALL)
-        style.map("Sub.TNotebook.Tab",
-                  background=[("selected", COLORS["bg_card"])],
-                  foreground=[("selected", COLORS["accent"])])
+        self._configure_ttk_styles()
 
         sub_nb_frame = tk.Frame(outer, bg=COLORS["bg"])
         sub_nb_frame.grid(row=1, column=0, sticky="nsew")
         sub_nb_frame.rowconfigure(0, weight=1)
         sub_nb_frame.columnconfigure(0, weight=1)
 
-        self._label_sub_nb = ttk.Notebook(sub_nb_frame, style="Sub.TNotebook")
+        self._label_sub_nb = ttk.Notebook(sub_nb_frame, style=self._sub_nb_style)
         self._label_sub_nb.grid(row=0, column=0, sticky="nsew")
 
         # Create the three child tabs
@@ -1453,9 +1819,9 @@ class MainGUI:
         self._ifu_run_btn = tk.Button(
             btn_frame, text="Run All Verifications",
             command=self._ifu_run_all,
-            bg=COLORS["accent"], fg="white",
-            activebackground=_lighten(COLORS["accent"]),
-            relief="flat", cursor="hand2",
+            bg=COLORS["accent2"], fg=contrast_text(COLORS["accent2"]),
+            activebackground=_lighten(COLORS["accent2"]),
+            activeforeground=contrast_text(COLORS["accent2"]),
             font=(FONT_BODY[0], FONT_BODY[1], "bold"),
             padx=12, pady=6, bd=0, state="disabled")
         self._ifu_run_btn.pack(side="left", padx=(0, 6))
@@ -1538,7 +1904,7 @@ class MainGUI:
         if _root_dir not in _sys.path:
             _sys.path.insert(0, _root_dir)
         try:
-            from ifu_verifier_window import extract_keywords, infer_required_sections
+            from ifu_verifier.ifu_verifier_window import extract_keywords, infer_required_sections
         except ImportError:
             extract_keywords = lambda t: []
             infer_required_sections = lambda t: []
@@ -1563,7 +1929,7 @@ class MainGUI:
             badge_f = tk.Frame(hdr_row, bg=COLORS["accent3"])
             badge_f.pack(side="left", padx=(0, 10))
             tk.Label(badge_f, text=e.prd_id,
-                     bg=COLORS["accent3"], fg="#0F172A",
+                     bg=COLORS["accent3"], fg=contrast_text(COLORS["accent3"]),
                      font=("Segoe UI", 8, "bold"), padx=8, pady=3).pack()
             method = getattr(e, "vv_method", "") or "Inspection"
             tk.Label(hdr_row, text=f"IFU requirement  |  {method}",
@@ -1599,7 +1965,7 @@ class MainGUI:
                          font=FONT_SMALL).pack(side="left", padx=(0, 6))
                 for sec in req_secs:
                     tk.Label(sec_row, text=sec,
-                             bg="#FEF3C7", fg=COLORS["accent3"],
+                             bg=_lighten(COLORS["accent3"]), fg=contrast_text(_lighten(COLORS["accent3"])),
                              font=FONT_SMALL, padx=5, pady=1,
                              highlightthickness=1,
                              highlightbackground=COLORS["accent3"]).pack(
@@ -1617,7 +1983,8 @@ class MainGUI:
                 row=0, column=0, sticky="w", padx=(0, 8))
 
             prog_bar = ttk.Progressbar(prog_outer, mode="determinate",
-                                       maximum=100, value=0)
+                                       maximum=100, value=0,
+                                       style=self._ifu_pb_style)
             prog_bar.grid(row=0, column=1, sticky="ew")
 
             # ── Match score label ─────────────────────────────────────
@@ -1846,7 +2213,7 @@ class MainGUI:
 
         badge = tk.Frame(card, bg=COLORS["accent3"])
         badge.pack(fill="x")
-        tk.Label(badge, text=symbol, bg=COLORS["accent3"], fg="#0F172A",
+        tk.Label(badge, text=symbol, bg=COLORS["accent3"], fg=contrast_text(COLORS["accent3"]),
                  font=("Segoe UI", 9, "bold"), padx=8, pady=4).pack(anchor="w")
 
         count_frame = tk.Frame(card, bg=COLORS["bg_card"])
@@ -1916,8 +2283,38 @@ class MainGUI:
 
     def _make_label_tab(self, parent):
         frame = tk.Frame(parent, bg=COLORS["bg"])
-        frame.rowconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
+
+        top = tk.Frame(frame, bg=COLORS["bg_card"],
+                       highlightthickness=1,
+                       highlightbackground=COLORS["border"])
+        top.grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=(10, 6))
+        top.columnconfigure(1, weight=1)
+
+        tk.Button(
+            top, text="← Previous", command=self._preview_prev_label,
+            bg=COLORS["bg_card"], fg=COLORS["text"],
+            activebackground=COLORS["border"], activeforeground=COLORS["text"],
+            relief="flat", cursor="hand2", font=FONT_SMALL,
+            padx=10, pady=5, bd=0,
+            highlightthickness=1, highlightbackground=COLORS["border"],
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=8)
+
+        tk.Label(
+            top, textvariable=self._preview_total_var,
+            bg=COLORS["bg_card"], fg=COLORS["text_muted"], font=FONT_SMALL,
+            anchor="center", justify="center",
+        ).grid(row=0, column=1, sticky="ew", padx=12)
+
+        tk.Button(
+            top, text="Next →", command=self._preview_next_label,
+            bg=COLORS["bg_card"], fg=COLORS["text"],
+            activebackground=COLORS["border"], activeforeground=COLORS["text"],
+            relief="flat", cursor="hand2", font=FONT_SMALL,
+            padx=10, pady=5, bd=0,
+            highlightthickness=1, highlightbackground=COLORS["border"],
+        ).grid(row=0, column=2, sticky="e", padx=8, pady=8)
 
         self._label_canvas = tk.Canvas(frame, bg=COLORS["bg"],
                                        highlightthickness=0)
@@ -1929,16 +2326,17 @@ class MainGUI:
                              bg=COLORS["bg_card"], troughcolor=COLORS["bg"])
         self._label_canvas.configure(yscrollcommand=vsb2.set,
                                      xscrollcommand=hsb2.set)
-        self._label_canvas.grid(row=0, column=0, sticky="nsew")
-        vsb2.grid(row=0, column=1, sticky="ns")
-        hsb2.grid(row=1, column=0, sticky="ew")
+        self._label_canvas.grid(row=1, column=0, sticky="nsew", padx=(10, 0), pady=(0, 10))
+        vsb2.grid(row=1, column=1, sticky="ns", pady=(0, 10))
+        hsb2.grid(row=2, column=0, sticky="ew", padx=(10, 0), pady=(0, 10))
+        self._bind_canvas_hover_scroll(self._label_canvas)
 
         self._label_photo    = None
         self._label_info_lbl = tk.Label(
             frame, text="No label image loaded.",
             bg=COLORS["bg"], fg=COLORS["text_muted"], font=FONT_BODY,
         )
-        self._label_info_lbl.grid(row=0, column=0)
+        self._label_info_lbl.grid(row=1, column=0)
 
         return frame
 
@@ -1957,7 +2355,7 @@ class MainGUI:
                  font=FONT_SMALL, anchor="w", padx=12).grid(
             row=0, column=0, sticky="w")
         tk.Label(bar, text="EVO MDD Verification Tool  ·  Philips Respironics",
-                 bg=COLORS["bg_card"], fg="#334155",
+                 bg=COLORS["bg_card"], fg=COLORS["text_muted"],
                  font=FONT_SMALL, padx=12).grid(row=0, column=1, sticky="e")
 
     # ── Canvas helpers ────────────────────────────────────────────────────
@@ -2056,7 +2454,7 @@ class MainGUI:
         try:
             self._label_info_lbl.grid_remove()
             img = _open_image_from_path(path)
-            img.thumbnail((1000, 1000), Image.LANCZOS)
+            img.thumbnail((1800, 1800), Image.LANCZOS)
             self._label_photo = ImageTk.PhotoImage(img)
             self._label_canvas.delete("all")
             self._label_canvas.create_image(4, 4, anchor="nw",
@@ -2064,6 +2462,17 @@ class MainGUI:
             self._label_canvas.configure(
                 scrollregion=(0, 0, img.width + 8, img.height + 8)
             )
+            total = len(self._label_paths)
+            try:
+                idx = self._label_paths.index(path)
+            except ValueError:
+                idx = max(self._preview_index, 0)
+            self._preview_index = idx
+            self._preview_total_var.set(
+                f"Label {idx + 1} / {total}  ·  {os.path.basename(path)}"
+            )
+            self._label_canvas.xview_moveto(0)
+            self._label_canvas.yview_moveto(0)
             self._nb.select(self._label_verification_tab)
             self._label_sub_nb.select(self._label_tab)
         except Exception as e:
@@ -2254,6 +2663,7 @@ class MainGUI:
     # ── Grid population helpers ───────────────────────────────────────────
 
     def _clear_results(self):
+        self._label_result_sections = []
         for w in self._grid_inner.winfo_children():
             w.destroy()
         self._photo_cache.clear()
@@ -2265,8 +2675,18 @@ class MainGUI:
         self._verdict_lbl.configure(fg=COLORS["text_muted"])
 
     def _append_label_section(self, fname: str, symbols: list,
-                               passed: bool, num: int, total: int):
+                               passed: bool, num: int, total: int,
+                               record_state: bool = True):
         """Insert a section header + symbol cards for one label into _grid_inner."""
+        if record_state:
+            self._label_result_sections.append({
+                "type": "result",
+                "fname": fname,
+                "symbols": list(symbols),
+                "passed": passed,
+                "num": num,
+                "total": total,
+            })
         # ── Section header row ────────────────────────────────────────
         hdr = tk.Frame(self._grid_inner, bg=COLORS["bg_card"],
                        highlightthickness=1,
@@ -2310,8 +2730,17 @@ class MainGUI:
         self._canvas.configure(scrollregion=self._canvas.bbox("all"))
 
     def _append_error_section(self, fname: str, exc: Exception,
-                               num: int, total: int):
+                               num: int, total: int,
+                               record_state: bool = True):
         """Insert an error notice for a failed label."""
+        if record_state:
+            self._label_result_sections.append({
+                "type": "error",
+                "fname": fname,
+                "message": str(exc),
+                "num": num,
+                "total": total,
+            })
         hdr = tk.Frame(self._grid_inner, bg=COLORS["bg_card"],
                        highlightthickness=1,
                        highlightbackground=COLORS["danger"])

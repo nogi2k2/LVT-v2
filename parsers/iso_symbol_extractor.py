@@ -530,12 +530,12 @@ class ExtractorWindow(tk.Toplevel):
         list_frame.grid_rowconfigure(0, weight=1)
         list_frame.grid_columnconfigure(0, weight=1)
 
-        self.sym_tree.heading("ref",   text="Reference")
-        self.sym_tree.heading("title", text="Title")
-        self.sym_tree.heading("image", text="Filename")
-        self.sym_tree.column("ref",   width=80,  minwidth=60)
-        self.sym_tree.column("title", width=180, minwidth=80)
-        self.sym_tree.column("image", width=200, minwidth=80)
+        self.sym_tree.heading("ref",   text="Reference", anchor="w")
+        self.sym_tree.heading("title", text="Title", anchor="w")
+        self.sym_tree.heading("image", text="Filename", anchor="w")
+        self.sym_tree.column("ref",   width=80,  minwidth=60, anchor="w")
+        self.sym_tree.column("title", width=180, minwidth=80, anchor="w")
+        self.sym_tree.column("image", width=200, minwidth=80, anchor="w")
 
         # Detail panel
         detail_frame = tk.Frame(parent, bg=COLORS["bg_card"], padx=10, pady=8)

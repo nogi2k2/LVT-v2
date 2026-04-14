@@ -700,8 +700,8 @@ class MapperWindow(tk.Toplevel):
         tf.grid_columnconfigure(0, weight=1)
 
         for col, width in zip(tree_cols, tree_widths):
-            self.tree.heading(col, text=col)
-            self.tree.column(col, width=width, minwidth=40)
+            self.tree.heading(col, text=col, anchor="w")
+            self.tree.column(col, width=width, minwidth=40, anchor="w")
 
         self.tree.tag_configure("odd",      background="#1E293B", foreground=COLORS["text"])
         self.tree.tag_configure("even",     background="#162032", foreground=COLORS["text"])

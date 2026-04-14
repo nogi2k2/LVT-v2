@@ -31,8 +31,11 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 from datetime import datetime
 
 try:
-    from app import (COLORS, FONT_TITLE, FONT_HEADING, FONT_BODY,
-                     FONT_MONO, FONT_SMALL, _lighten)
+    from gui.theme import (
+        COLORS, FONT_TITLE, FONT_HEADING, FONT_BODY,
+        FONT_MONO, FONT_SMALL, lighten as _lighten,
+        contrast_text,
+    )
 except ImportError:
     COLORS = {
         "bg": "#F5F7FA", "bg_card": "#FFFFFF", "bg_input": "#FFFFFF",
@@ -42,12 +45,14 @@ except ImportError:
         "border": "#D1D5DB", "header_bg": "#0B54A4",
         "danger": "#DC2626", "success": "#16A34A", "warn": "#D97706",
         "log_bg": "#F8FAFC", "log_text": "#1E3A5F",
+        "header_subtle": "#BFDBFE",
     }
     FONT_TITLE   = ("Segoe UI", 16, "bold")
     FONT_HEADING = ("Segoe UI", 11, "bold")
     FONT_BODY    = ("Segoe UI",  9)
     FONT_MONO    = ("Consolas",  9)
     FONT_SMALL   = ("Segoe UI",  8)
+    def contrast_text(hex_color): return "#0F172A"
     def _lighten(h):
         h = h.lstrip("#"); r, g, b = [int(h[i:i+2], 16) for i in (0, 2, 4)]
         return f"#{min(255,r+30):02x}{min(255,g+30):02x}{min(255,b+30):02x}"
@@ -66,6 +71,28 @@ _STOP_WORDS = {
     "no","nor","our","out","so","than","their","them","then","there",
     "these","they","this","those","through","under","up","use","very",
     "when","where","who","will","with","would","you","your",
+}
+
+IFU_LIGHT_COLORS = dict(COLORS)
+IFU_DARK_COLORS = {
+    **IFU_LIGHT_COLORS,
+    "bg": "#0F172A",
+    "bg_card": "#111827",
+    "bg_input": "#0B1220",
+    "accent": "#60A5FA",
+    "accent_light": "#93C5FD",
+    "accent2": "#22C55E",
+    "accent3": "#F59E0B",
+    "text": "#E5E7EB",
+    "text_muted": "#94A3B8",
+    "border": "#334155",
+    "header_bg": "#1D4ED8",
+    "danger": "#F87171",
+    "success": "#4ADE80",
+    "warn": "#FBBF24",
+    "log_bg": "#0B1220",
+    "log_text": "#E2E8F0",
+    "header_subtle": "#BFDBFE",
 }
 
 
@@ -631,7 +658,6 @@ class IFUVerifierWindow(tk.Toplevel):
     def __init__(self, parent, ifu_prds: list, plan_data=None):
         super().__init__(parent)
         self.title("IFU Verification — EVO MDD Verification Tool")
-        self.configure(bg=COLORS["bg"])
         self.resizable(True, True)
 
         self._prds      = ifu_prds
@@ -640,6 +666,7 @@ class IFUVerifierWindow(tk.Toplevel):
         self._ifu_path  = tk.StringVar()
         self._model_var = tk.StringVar(value=self.DEFAULT_MODEL)
         self._running   = False
+        self._theme_name = "light"
 
         # Check required packages
         self._missing = []
@@ -656,8 +683,125 @@ class IFUVerifierWindow(tk.Toplevel):
             self._build_missing_deps_ui()
         else:
             self._build_ui()
-
         self._center()
+
+    def _colors(self) -> dict:
+        return IFU_LIGHT_COLORS if self._theme_name == "light" else IFU_DARK_COLORS
+
+    def _theme_button_label(self) -> str:
+        return "☀ Light" if self._theme_name == "dark" else "☾ Dark"
+
+    def _toggle_theme(self):
+        self._theme_name = "dark" if self._theme_name == "light" else "light"
+        if self._missing:
+            self._apply_missing_theme()
+        else:
+            self._apply_theme_in_place()
+
+    def _style_progressbar(self):
+        c = self._colors()
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure(
+            "IFU.Horizontal.TProgressbar",
+            troughcolor=c["border"],
+            background=c["accent"],
+            bordercolor=c["border"],
+            lightcolor=c["accent"],
+            darkcolor=c["accent"],
+        )
+
+    def _configure_log_tags(self):
+        self._log_text.tag_config("OK", foreground=self._colors()["success"])
+        self._log_text.tag_config("WARN", foreground=self._colors()["warn"])
+        self._log_text.tag_config("ERROR", foreground=self._colors()["danger"])
+
+    def _verdict_colour(self, verdict: str) -> str:
+        c = self._colors()
+        if verdict == "PASS":
+            return c["success"]
+        if verdict == "FAIL":
+            return c["danger"]
+        if verdict == "MANUAL":
+            return c["warn"]
+        return c["text_muted"]
+
+    def _apply_missing_theme(self):
+        c = self._colors()
+        self.configure(bg=c["bg"])
+        if hasattr(self, "_missing_root"):
+            self._missing_root.configure(bg=c["bg"])
+            self._missing_theme_btn.configure(
+                text=self._theme_button_label(), bg=c["bg_card"], fg=c["text"],
+                activebackground=c["border"], activeforeground=c["text"],
+                highlightbackground=c["border"])
+            self._missing_title.configure(bg=c["bg"], fg=c["danger"])
+            self._missing_intro.configure(bg=c["bg"], fg=c["text"])
+            for label in getattr(self, "_missing_pkg_labels", []):
+                label.configure(bg=c["bg"], fg=c["text"])
+            self._missing_hint.configure(bg=c["bg"], fg=c["text_muted"])
+
+    def _apply_theme_in_place(self):
+        c = self._colors()
+        self.configure(bg=c["bg"])
+        self._style_progressbar()
+
+        self._hdr.configure(bg=c["header_bg"])
+        self._theme_btn.configure(text=self._theme_button_label(), bg=c["header_bg"], fg="white", activebackground=_lighten(c["header_bg"]), activeforeground="white")
+        self._hdr_title.configure(bg=c["header_bg"], fg="white")
+        self._hdr_meta.configure(bg=c["header_bg"], fg=c["header_subtle"])
+
+        self._bar.configure(bg=c["bg_card"], highlightbackground=c["border"])
+        self._ifu_label.configure(bg=c["bg_card"], fg=c["text_muted"])
+        self._ifu_entry.configure(bg=c["bg_input"], fg=c["text"], readonlybackground=c["bg_input"], highlightbackground=c["border"], insertbackground=c["text"])
+        self._browse_btn.configure(bg=c["bg_card"], fg=c["text"], activebackground=c["border"], activeforeground=c["text"], highlightbackground=c["border"])
+        self._model_label.configure(bg=c["bg_card"], fg=c["text_muted"])
+        self._model_entry.configure(bg=c["bg_input"], fg=c["text"], highlightbackground=c["border"], insertbackground=c["text"])
+        self._ollama_status_lbl.configure(bg=c["bg_card"], fg=c["text_muted"])
+        self._check_btn.configure(bg=c["bg_card"], fg=c["text"], activebackground=c["border"], activeforeground=c["text"], highlightbackground=c["border"])
+
+        self._paned.configure(bg=c["border"])
+        self._cards_panel.configure(bg=c["bg"])
+        self._cards_canvas.configure(bg=c["bg"])
+        self._cards_inner.configure(bg=c["bg"])
+        self._log_panel.configure(bg=c["bg"])
+        self._log_title.configure(bg=c["bg"], fg=c["text_muted"])
+        self._log_text.configure(bg=c["log_bg"], fg=c["log_text"], insertbackground=c["log_text"])
+        self._configure_log_tags()
+
+        self._footer.configure(bg=c["bg_card"], highlightbackground=c["border"])
+        self._summary_lbl.configure(bg=c["bg_card"], fg=c["text_muted"])
+        self._pb.configure(style="IFU.Horizontal.TProgressbar")
+        self._export_btn.configure(bg=c["accent2"], fg=contrast_text(c["accent2"]), activebackground=_lighten(c["accent2"]), activeforeground=contrast_text(c["accent2"]))
+        self._run_btn.configure(bg=c["accent"], fg=contrast_text(c["accent"]), activebackground=_lighten(c["accent"]), activeforeground=contrast_text(c["accent"]))
+
+        for card in self._cards:
+            self._refresh_card_theme(card)
+
+    def _refresh_card_theme(self, card: dict):
+        c = self._colors()
+        card["card"].configure(bg=c["bg_card"], highlightbackground=c["border"])
+        card["accent_bar"].configure(bg=c["accent3"])
+        card["body"].configure(bg=c["bg_card"])
+        card["badge"].configure(bg=c["accent3"])
+        card["badge_label"].configure(bg=c["accent3"], fg=contrast_text(c["accent3"]))
+        card["method_lbl"].configure(bg=c["bg_card"], fg=c["text_muted"])
+        card["requirement_lbl"].configure(bg=c["bg_card"], fg=c["text"])
+        card["verdict_frame"].configure(bg=c["bg_card"])
+        card["conf_lbl"].configure(bg=c["bg_card"], fg=c["text_muted"])
+        card["reason_lbl"].configure(bg=c["bg_card"], fg=c["text_muted"])
+        card["evidence_lbl"].configure(bg=c["bg_card"], fg=c["accent"])
+        card["action_row"].configure(bg=c["bg_card"])
+        card["pass_btn"].configure(bg=c["success"], fg=contrast_text(c["success"]), activebackground=_lighten(c["success"]), activeforeground=contrast_text(c["success"]))
+        card["fail_btn"].configure(bg=c["danger"], fg=contrast_text(c["danger"]), activebackground=_lighten(c["danger"]), activeforeground=contrast_text(c["danger"]))
+        card["manual_btn"].configure(bg=c["accent3"], fg=contrast_text(c["accent3"]), activebackground=_lighten(c["accent3"]), activeforeground=contrast_text(c["accent3"]))
+        card["notes_row"].configure(bg=c["bg_card"])
+        card["notes_lbl"].configure(bg=c["bg_card"], fg=c["text_muted"])
+        card["notes_text"].configure(bg=c["bg_input"], fg=c["text"], highlightbackground=c["border"], insertbackground=c["text"])
+        card["verdict_lbl"].configure(bg=c["bg_card"], fg=self._verdict_colour(card["verdict_var"].get()))
 
     def _center(self):
         self.update_idletasks()
@@ -675,139 +819,178 @@ class IFUVerifierWindow(tk.Toplevel):
     # ── Missing deps notice ───────────────────────────────────────────────
 
     def _build_missing_deps_ui(self):
-        f = tk.Frame(self, bg=COLORS["bg"], padx=30, pady=30)
+        c = self._colors()
+        f = tk.Frame(self, bg=c["bg"], padx=30, pady=30)
         f.pack(fill="both", expand=True)
-        tk.Label(f, text="Missing dependencies",
-                 bg=COLORS["bg"], fg=COLORS["danger"],
-                 font=FONT_HEADING).pack(anchor="w")
-        tk.Label(f,
+        self._missing_root = f
+        self._missing_theme_btn = tk.Button(f, text=self._theme_button_label(), command=self._toggle_theme,
+                 bg=c["bg_card"], fg=c["text"], activebackground=c["border"], activeforeground=c["text"],
+                 relief="flat", cursor="hand2", font=FONT_SMALL, padx=10, pady=4, bd=0,
+                 highlightthickness=1, highlightbackground=c["border"])
+        self._missing_theme_btn.pack(anchor="e")
+        self._missing_title = tk.Label(f, text="Missing dependencies",
+                 bg=c["bg"], fg=c["danger"],
+                 font=FONT_HEADING)
+        self._missing_title.pack(anchor="w")
+        self._missing_intro = tk.Label(f,
                  text="Install the following packages then restart the tool:",
-                 bg=COLORS["bg"], fg=COLORS["text"],
-                 font=FONT_BODY).pack(anchor="w", pady=(8, 4))
+                 bg=c["bg"], fg=c["text"],
+                 font=FONT_BODY)
+        self._missing_intro.pack(anchor="w", pady=(8, 4))
+        self._missing_pkg_labels = []
         for pkg in self._missing:
-            tk.Label(f, text=f"  pip install {pkg}",
-                     bg=COLORS["bg"], fg=COLORS["text"],
-                     font=FONT_MONO).pack(anchor="w")
-        tk.Label(f,
+            lbl = tk.Label(f, text=f"  pip install {pkg}",
+                     bg=c["bg"], fg=c["text"],
+                     font=FONT_MONO)
+            lbl.pack(anchor="w")
+            self._missing_pkg_labels.append(lbl)
+        self._missing_hint = tk.Label(f,
                  text=f"\nAlso ensure Ollama is running:\n"
                       f"  ollama pull {self.DEFAULT_MODEL}",
-                 bg=COLORS["bg"], fg=COLORS["text_muted"],
-                 font=FONT_SMALL).pack(anchor="w", pady=(12, 0))
+                 bg=c["bg"], fg=c["text_muted"],
+                 font=FONT_SMALL)
+        self._missing_hint.pack(anchor="w", pady=(12, 0))
 
     # ── Main UI ───────────────────────────────────────────────────────────
 
     def _build_ui(self):
+        c = self._colors()
         # ── Header ────────────────────────────────────────────────────────
-        hdr = tk.Frame(self, bg=COLORS["header_bg"], padx=20, pady=14)
+        hdr = tk.Frame(self, bg=c["header_bg"], padx=20, pady=14)
         hdr.pack(fill="x")
-        tk.Label(hdr, text="IFU Verification",
-                 bg=COLORS["header_bg"], fg="white",
-                 font=FONT_TITLE).pack(side="left")
+        self._hdr = hdr
+        self._theme_btn = tk.Button(hdr, text=self._theme_button_label(), command=self._toggle_theme,
+                 bg=c["header_bg"], fg="white", activebackground=_lighten(c["header_bg"]), activeforeground="white",
+                 relief="flat", cursor="hand2", font=FONT_SMALL, padx=10, pady=4, bd=0)
+        self._theme_btn.pack(side="right")
+        self._hdr_title = tk.Label(hdr, text="IFU Verification",
+                 bg=c["header_bg"], fg="white",
+                 font=FONT_TITLE)
+        self._hdr_title.pack(side="left")
         meta = ""
         if self._plan_data:
             title = getattr(self._plan_data, "doc_title", "") or ""
             er    = getattr(self._plan_data, "er_number", "") or ""
             meta  = (f"  ·  {title[:50]}  |  ER: {er}"
                      f"  |  {len(self._prds)} IFU PRD(s)")
-        tk.Label(hdr, text=meta,
-                 bg=COLORS["header_bg"], fg="#BFDBFE",
-                 font=FONT_SMALL).pack(side="left", padx=(8, 0))
+        self._hdr_meta = tk.Label(hdr, text=meta,
+                 bg=c["header_bg"], fg=c["header_subtle"],
+                 font=FONT_SMALL)
+        self._hdr_meta.pack(side="left", padx=(8, 0))
 
         # ── Input bar ─────────────────────────────────────────────────────
-        bar = tk.Frame(self, bg=COLORS["bg_card"],
+        bar = tk.Frame(self, bg=c["bg_card"],
                        highlightthickness=1,
-                       highlightbackground=COLORS["border"],
+                   highlightbackground=c["border"],
                        padx=16, pady=10)
         bar.pack(fill="x")
         bar.columnconfigure(1, weight=1)
+        self._bar = bar
 
         # IFU file
-        tk.Label(bar, text="IFU Document (PDF):",
-                 bg=COLORS["bg_card"], fg=COLORS["text_muted"],
-                 font=FONT_SMALL).grid(row=0, column=0, sticky="w", padx=(0, 8))
-        tk.Entry(bar, textvariable=self._ifu_path, state="readonly",
-                 bg=COLORS["bg_input"], fg=COLORS["text"],
-                 readonlybackground=COLORS["bg_input"],
+        self._ifu_label = tk.Label(bar, text="IFU Document (PDF):",
+                 bg=c["bg_card"], fg=c["text_muted"],
+                 font=FONT_SMALL)
+        self._ifu_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self._ifu_entry = tk.Entry(bar, textvariable=self._ifu_path, state="readonly",
+                 bg=c["bg_input"], fg=c["text"],
+                 readonlybackground=c["bg_input"],
                  relief="flat", font=FONT_MONO,
                  highlightthickness=1,
-                 highlightbackground=COLORS["border"]).grid(
-            row=0, column=1, sticky="ew", padx=(0, 8))
-        tk.Button(bar, text="Browse…",
+                 highlightbackground=c["border"], insertbackground=c["text"])
+        self._ifu_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        self._browse_btn = tk.Button(bar, text="Browse…",
                   command=self._browse_ifu,
-                  bg=COLORS["bg_card"], fg=COLORS["text"],
-                  activebackground=COLORS["border"],
+                  bg=c["bg_card"], fg=c["text"],
+                  activebackground=c["border"], activeforeground=c["text"],
                   relief="flat", cursor="hand2",
                   font=FONT_SMALL, padx=10, pady=4, bd=0,
                   highlightthickness=1,
-                  highlightbackground=COLORS["border"]).grid(row=0, column=2)
+                  highlightbackground=c["border"])
+        self._browse_btn.grid(row=0, column=2)
 
         # Ollama model
-        tk.Label(bar, text="Ollama model:",
-                 bg=COLORS["bg_card"], fg=COLORS["text_muted"],
-                 font=FONT_SMALL).grid(row=1, column=0, sticky="w",
-                                       padx=(0, 8), pady=(6, 0))
-        tk.Entry(bar, textvariable=self._model_var,
-                 bg=COLORS["bg_input"], fg=COLORS["text"],
-                 relief="flat", font=FONT_MONO,
-                 highlightthickness=1,
-                 highlightbackground=COLORS["border"],
-                 width=24).grid(row=1, column=1, sticky="w", pady=(6, 0))
+        #------------------------------------------------
+        self._model_label = tk.Label(bar, text="Ollama model:",
+                bg=c["bg_card"], fg=c["text_muted"],
+                font=FONT_SMALL)
+        self._model_label.grid(row=1, column=0, sticky="w",
+                                    padx=(0, 8), pady=(6, 0))
+        self._model_entry = tk.Entry(bar, textvariable=self._model_var,
+                bg=c["bg_input"], fg=c["text"],
+                relief="flat", font=FONT_MONO,
+                highlightthickness=1,
+                highlightbackground=c["border"], insertbackground=c["text"],
+                width=24)
+        self._model_entry.grid(row=1, column=1, sticky="w", pady=(6, 0))
+        #------------------------------------------------
 
         self._ollama_status_var = tk.StringVar(value="")
-        tk.Label(bar, textvariable=self._ollama_status_var,
-                 bg=COLORS["bg_card"], fg=COLORS["text_muted"],
-                 font=FONT_SMALL).grid(row=1, column=2, sticky="w",
-                                       padx=(8, 0), pady=(6, 0))
-        tk.Button(bar, text="Check Ollama",
-                  command=self._check_ollama,
-                  bg=COLORS["bg_card"], fg=COLORS["text"],
-                  activebackground=COLORS["border"],
-                  relief="flat", cursor="hand2",
-                  font=FONT_SMALL, padx=8, pady=3, bd=0,
-                  highlightthickness=1,
-                  highlightbackground=COLORS["border"]).grid(
-            row=1, column=3, padx=(8, 0), pady=(6, 0))
+        
+        #------------------------------------------------
+        self._ollama_status_lbl = tk.Label(bar, textvariable=self._ollama_status_var,
+                bg=c["bg_card"], fg=c["text_muted"],
+                font=FONT_SMALL)
+        self._ollama_status_lbl.grid(row=1, column=2, sticky="w",
+                                    padx=(8, 0), pady=(6, 0))
+        self._check_btn = tk.Button(bar, text="Check Ollama",
+                command=self._check_ollama,
+            bg=c["bg_card"], fg=c["text"],
+            activebackground=c["border"], activeforeground=c["text"],
+                relief="flat", cursor="hand2",
+                font=FONT_SMALL, padx=8, pady=3, bd=0,
+                highlightthickness=1,
+            highlightbackground=c["border"])
+        self._check_btn.grid(row=1, column=3, padx=(8, 0), pady=(6, 0))
+        #------------------------------------------------
 
         # ── Paned: cards left, log right ──────────────────────────────────
         paned = tk.PanedWindow(self, orient="horizontal",
-                               bg=COLORS["border"],
+                       bg=c["border"],
                                sashwidth=5, sashrelief="flat")
         paned.pack(fill="both", expand=True)
+        self._paned = paned
         left  = self._build_cards_panel(paned)
         right = self._build_log_panel(paned)
         paned.add(left,  minsize=600, stretch="always")
         paned.add(right, minsize=260, stretch="never")
 
         # ── Footer ────────────────────────────────────────────────────────
-        footer = tk.Frame(self, bg=COLORS["bg_card"],
+        footer = tk.Frame(self, bg=c["bg_card"],
                           highlightthickness=1,
-                          highlightbackground=COLORS["border"],
+                          highlightbackground=c["border"],
                           padx=16, pady=8)
         footer.pack(fill="x", side="bottom")
+        self._footer = footer
 
         self._summary_var = tk.StringVar(value="")
-        tk.Label(footer, textvariable=self._summary_var,
-                 bg=COLORS["bg_card"], fg=COLORS["text_muted"],
-                 font=FONT_SMALL).pack(side="left")
+        self._summary_lbl = tk.Label(footer, textvariable=self._summary_var,
+                 bg=c["bg_card"], fg=c["text_muted"],
+                 font=FONT_SMALL)
+        self._summary_lbl.pack(side="left")
 
         self._progress_var = tk.DoubleVar(value=0)
+        self._style_progressbar()
         self._pb = ttk.Progressbar(footer, variable=self._progress_var,
                                    maximum=100, length=180,
-                                   mode="determinate")
+                                   mode="determinate", style="IFU.Horizontal.TProgressbar")
         self._pb.pack(side="left", padx=(16, 0))
 
-        tk.Button(footer, text="Export PDF Report",
+        self._export_btn = tk.Button(footer, text="Export PDF Report",
                   command=self._export_pdf,
-                  bg=COLORS["accent2"], fg="white",
-                  activebackground=_lighten(COLORS["accent2"]),
+                  bg=c["accent2"], fg=contrast_text(c["accent2"]),
+                  activebackground=_lighten(c["accent2"]),
                   relief="flat", cursor="hand2",
-                  font=FONT_BODY, padx=14, pady=6, bd=0).pack(side="right")
+                  font=FONT_BODY, padx=14, pady=6, bd=0,
+                  activeforeground=contrast_text(c["accent2"]))
+        self._export_btn.pack(side="right")
 
         self._run_btn = tk.Button(
             footer, text="▶  Run All Verifications",
             command=self._run_all,
-            bg=COLORS["accent"], fg="white",
-            activebackground=_lighten(COLORS["accent"]),
+            bg=c["accent"], fg=contrast_text(c["accent"]),
+            activebackground=_lighten(c["accent"]),
+            activeforeground=contrast_text(c["accent"]),
             relief="flat", cursor="hand2",
             font=(FONT_BODY[0], FONT_BODY[1], "bold"),
             padx=14, pady=6, bd=0)
@@ -818,15 +1001,16 @@ class IFUVerifierWindow(tk.Toplevel):
     # ── Cards panel ───────────────────────────────────────────────────────
 
     def _build_cards_panel(self, parent):
-        frame  = tk.Frame(parent, bg=COLORS["bg"])
-        canvas = tk.Canvas(frame, bg=COLORS["bg"], highlightthickness=0)
+        c = self._colors()
+        frame  = tk.Frame(parent, bg=c["bg"])
+        canvas = tk.Canvas(frame, bg=c["bg"], highlightthickness=0)
         vsb    = tk.Scrollbar(frame, orient="vertical",
                               command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
 
-        inner = tk.Frame(canvas, bg=COLORS["bg"])
+        inner = tk.Frame(canvas, bg=c["bg"])
         win   = canvas.create_window((0, 0), window=inner, anchor="nw")
         inner.bind("<Configure>",
                    lambda e: canvas.configure(
@@ -837,11 +1021,15 @@ class IFUVerifierWindow(tk.Toplevel):
                         lambda e: canvas.yview_scroll(
                             -1 * (e.delta // 120), "units"))
 
+        self._cards_panel = frame
+        self._cards_canvas = canvas
+        self._cards_inner = inner
+
         if not self._prds:
             tk.Label(inner,
                      text="No IFU PRDs found in the V&V Plan.\n"
                           "Load a V&V Plan from the home screen first.",
-                     bg=COLORS["bg"], fg=COLORS["text_muted"],
+                     bg=c["bg"], fg=c["text_muted"],
                      font=FONT_BODY, justify="center").pack(
                 pady=40, padx=20)
         else:
@@ -854,55 +1042,61 @@ class IFUVerifierWindow(tk.Toplevel):
     # ── Log panel ─────────────────────────────────────────────────────────
 
     def _build_log_panel(self, parent):
-        frame = tk.Frame(parent, bg=COLORS["bg"])
-        tk.Label(frame, text="Verification Log",
-                 bg=COLORS["bg"], fg=COLORS["text_muted"],
-                 font=FONT_SMALL).pack(anchor="w", padx=8, pady=(8, 2))
+        c = self._colors()
+        frame = tk.Frame(parent, bg=c["bg"])
+        self._log_title = tk.Label(frame, text="Verification Log",
+                 bg=c["bg"], fg=c["text_muted"],
+                 font=FONT_SMALL)
+        self._log_title.pack(anchor="w", padx=8, pady=(8, 2))
         self._log_text = scrolledtext.ScrolledText(
-            frame, bg=COLORS["log_bg"], fg=COLORS["log_text"],
+            frame, bg=c["log_bg"], fg=c["log_text"],
             font=FONT_MONO, state="disabled", relief="flat", wrap="word")
         self._log_text.pack(fill="both", expand=True, padx=4, pady=(0, 4))
-        self._log_text.tag_config("OK",    foreground=COLORS["success"])
-        self._log_text.tag_config("WARN",  foreground=COLORS["warn"])
-        self._log_text.tag_config("ERROR", foreground=COLORS["danger"])
+        self._configure_log_tags()
+        self._log_panel = frame
         return frame
 
     # ── PRD card ──────────────────────────────────────────────────────────
 
     def _make_prd_card(self, parent, prd) -> dict:
-        card = tk.Frame(parent, bg=COLORS["bg_card"],
+        c = self._colors()
+        card = tk.Frame(parent, bg=c["bg_card"],
                         highlightthickness=1,
-                        highlightbackground=COLORS["border"])
+                        highlightbackground=c["border"])
         card.pack(fill="x", padx=12, pady=6)
 
         # Amber accent bar (IFU colour)
-        tk.Frame(card, bg=COLORS["accent3"], height=3).pack(fill="x")
+        accent_bar = tk.Frame(card, bg=c["accent3"], height=3)
+        accent_bar.pack(fill="x")
 
-        body = tk.Frame(card, bg=COLORS["bg_card"], padx=14, pady=10)
+        body = tk.Frame(card, bg=c["bg_card"], padx=14, pady=10)
         body.pack(fill="x")
         body.columnconfigure(2, weight=1)
 
         # Row 0: badge + method
-        badge = tk.Frame(body, bg=COLORS["accent3"])
+        badge = tk.Frame(body, bg=c["accent3"])
         badge.grid(row=0, column=0, sticky="nw", padx=(0, 10), pady=(0, 4))
-        tk.Label(badge, text=prd.prd_id,
-                 bg=COLORS["accent3"], fg="#0F172A",
-                 font=("Segoe UI", 8, "bold"), padx=8, pady=3).pack()
+        badge_label = tk.Label(badge, text=prd.prd_id,
+                 bg=c["accent3"], fg=contrast_text(c["accent3"]),
+                 font=("Segoe UI", 8, "bold"), padx=8, pady=3)
+        badge_label.pack()
 
         method_text = getattr(prd, "vv_method", "") or "Inspection"
-        tk.Label(body, text=f"Method: {method_text}  |  IFU requirement",
-                 bg=COLORS["bg_card"], fg=COLORS["text_muted"],
-                 font=FONT_SMALL).grid(row=0, column=1, sticky="w")
+        method_lbl = tk.Label(body, text=f"Method: {method_text}  |  IFU requirement",
+                 bg=c["bg_card"], fg=c["text_muted"],
+                 font=FONT_SMALL)
+        method_lbl.grid(row=0, column=1, sticky="w")
 
         # Row 1: requirement text
-        tk.Label(body, text=prd.requirement_text,
-                 bg=COLORS["bg_card"], fg=COLORS["text"],
+        requirement_lbl = tk.Label(body, text=prd.requirement_text,
+                 bg=c["bg_card"], fg=c["text"],
                  font=FONT_SMALL, anchor="w",
-                 wraplength=540, justify="left").grid(
+                 wraplength=540, justify="left")
+        requirement_lbl.grid(
             row=1, column=0, columnspan=3, sticky="w", pady=(0, 6))
 
         # Row 2: verdict area (populated after LLM runs)
-        verdict_frame = tk.Frame(body, bg=COLORS["bg_card"])
+        verdict_frame = tk.Frame(body, bg=c["bg_card"])
         verdict_frame.grid(row=2, column=0, columnspan=3, sticky="ew",
                            pady=(0, 4))
 
@@ -914,18 +1108,18 @@ class IFUVerifierWindow(tk.Toplevel):
         ev_para_var  = tk.StringVar(value="")
 
         verdict_lbl = tk.Label(verdict_frame, text="PENDING",
-                               bg=COLORS["bg_card"], fg=COLORS["text_muted"],
+                                         bg=c["bg_card"], fg=c["text_muted"],
                                font=("Segoe UI", 9, "bold"))
         verdict_lbl.pack(side="left", padx=(0, 10))
 
         conf_lbl = tk.Label(verdict_frame, textvariable=conf_var,
-                            bg=COLORS["bg_card"], fg=COLORS["text_muted"],
+                                     bg=c["bg_card"], fg=c["text_muted"],
                             font=FONT_SMALL)
         conf_lbl.pack(side="left")
 
         # Row 3: reason text
         reason_lbl = tk.Label(body, textvariable=reason_var,
-                              bg=COLORS["bg_card"], fg=COLORS["text_muted"],
+                              bg=c["bg_card"], fg=c["text_muted"],
                               font=FONT_SMALL, anchor="w",
                               wraplength=520, justify="left")
         reason_lbl.grid(row=3, column=0, columnspan=3, sticky="w",
@@ -933,15 +1127,15 @@ class IFUVerifierWindow(tk.Toplevel):
 
         # Row 4: evidence text (italic)
         evidence_lbl = tk.Label(body, textvariable=evidence_var,
-                                bg=COLORS["bg_card"],
-                                fg=COLORS["accent"],
+                                bg=c["bg_card"],
+                                fg=c["accent"],
                                 font=(FONT_SMALL[0], FONT_SMALL[1], "italic"),
                                 anchor="w", wraplength=520, justify="left")
         evidence_lbl.grid(row=4, column=0, columnspan=3, sticky="w",
                           pady=(0, 6))
 
         # Row 5: override buttons + notes
-        action_row = tk.Frame(body, bg=COLORS["bg_card"])
+        action_row = tk.Frame(body, bg=c["bg_card"])
         action_row.grid(row=5, column=0, columnspan=3, sticky="ew",
                         pady=(4, 0))
 
@@ -950,46 +1144,55 @@ class IFUVerifierWindow(tk.Toplevel):
             verdict_lbl.configure(text=label_text, fg=colour)
             self._update_summary()
 
-        tk.Button(action_row, text="✔  Pass",
+        pass_btn = tk.Button(action_row, text="✔  Pass",
                   command=lambda: _mark("PASS", "✔  PASS",
-                                        COLORS["success"]),
-                  bg=COLORS["success"], fg="white",
-                  activebackground=_lighten(COLORS["success"]),
+                                        self._colors()["success"]),
+                  bg=c["success"], fg=contrast_text(c["success"]),
+                  activebackground=_lighten(c["success"]),
                   relief="flat", cursor="hand2",
-                  font=FONT_SMALL, padx=10, pady=5, bd=0).pack(
-            side="left", padx=(0, 4))
-        tk.Button(action_row, text="✗  Fail",
+                  font=FONT_SMALL, padx=10, pady=5, bd=0)
+        pass_btn.pack(side="left", padx=(0, 4))
+        fail_btn = tk.Button(action_row, text="✗  Fail",
                   command=lambda: _mark("FAIL", "✗  FAIL",
-                                        COLORS["danger"]),
-                  bg=COLORS["danger"], fg="white",
-                  activebackground=_lighten(COLORS["danger"]),
+                                        self._colors()["danger"]),
+                  bg=c["danger"], fg=contrast_text(c["danger"]),
+                  activebackground=_lighten(c["danger"]),
                   relief="flat", cursor="hand2",
-                  font=FONT_SMALL, padx=10, pady=5, bd=0).pack(
-            side="left", padx=(0, 4))
-        tk.Button(action_row, text="○  Manual Review",
+                  font=FONT_SMALL, padx=10, pady=5, bd=0)
+        fail_btn.pack(side="left", padx=(0, 4))
+        manual_btn = tk.Button(action_row, text="○  Manual Review",
                   command=lambda: _mark("MANUAL", "○  MANUAL REVIEW",
-                                        COLORS["warn"]),
-                  bg=COLORS["accent3"], fg="white",
-                  activebackground=_lighten(COLORS["accent3"]),
+                                        self._colors()["warn"]),
+                  bg=c["accent3"], fg=contrast_text(c["accent3"]),
+                  activebackground=_lighten(c["accent3"]),
                   relief="flat", cursor="hand2",
-                  font=FONT_SMALL, padx=10, pady=5, bd=0).pack(
-            side="left")
+                  font=FONT_SMALL, padx=10, pady=5, bd=0)
+        manual_btn.pack(side="left")
 
         # Row 6: notes
-        notes_row = tk.Frame(body, bg=COLORS["bg_card"])
+        notes_row = tk.Frame(body, bg=c["bg_card"])
         notes_row.grid(row=6, column=0, columnspan=3, sticky="ew",
                        pady=(6, 0))
-        tk.Label(notes_row, text="Engineer notes:",
-                 bg=COLORS["bg_card"], fg=COLORS["text_muted"],
-                 font=FONT_SMALL).pack(anchor="w")
+        notes_lbl = tk.Label(notes_row, text="Engineer notes:",
+                 bg=c["bg_card"], fg=c["text_muted"],
+                 font=FONT_SMALL)
+        notes_lbl.pack(anchor="w")
         notes_text = tk.Text(notes_row, height=2,
-                             bg=COLORS["bg_input"], fg=COLORS["text"],
+                             bg=c["bg_input"], fg=c["text"],
                              font=FONT_SMALL, relief="flat", wrap="word",
                              highlightthickness=1,
-                             highlightbackground=COLORS["border"])
+                             highlightbackground=c["border"], insertbackground=c["text"])
         notes_text.pack(fill="x")
 
         return {
+            "card":        card,
+            "accent_bar":  accent_bar,
+            "body":        body,
+            "badge":       badge,
+            "badge_label": badge_label,
+            "method_lbl":  method_lbl,
+            "requirement_lbl": requirement_lbl,
+            "verdict_frame": verdict_frame,
             "prd":         prd,
             "verdict_var": verdict_var,
             "conf_var":    conf_var,
@@ -999,6 +1202,14 @@ class IFUVerifierWindow(tk.Toplevel):
             "ev_para_var": ev_para_var,
             "verdict_lbl": verdict_lbl,
             "conf_lbl":    conf_lbl,
+            "reason_lbl":  reason_lbl,
+            "evidence_lbl": evidence_lbl,
+            "action_row":  action_row,
+            "pass_btn":    pass_btn,
+            "fail_btn":    fail_btn,
+            "manual_btn":  manual_btn,
+            "notes_row":   notes_row,
+            "notes_lbl":   notes_lbl,
             "notes_text":  notes_text,
         }
 
@@ -1011,7 +1222,7 @@ class IFUVerifierWindow(tk.Toplevel):
 
         def _thread():
             try:
-                from ifu_llm_checker import IFULLMChecker
+                from ifu_verifier.ifu_llm_checker import IFULLMChecker
                 checker  = IFULLMChecker(model=model)
                 ok, msg  = checker.is_available()
                 level    = "OK" if ok else "ERROR"
@@ -1071,7 +1282,7 @@ class IFUVerifierWindow(tk.Toplevel):
 
                 self._log(f"IFU: {len(pages)} pages extracted")
 
-                from ifu_llm_checker import IFULLMChecker
+                from ifu_verifier.ifu_llm_checker import IFULLMChecker
                 checker = IFULLMChecker(model=model)
 
                 total = len(self._cards)
@@ -1204,7 +1415,7 @@ class IFUVerifierWindow(tk.Toplevel):
 
         def _build():
             try:
-                from ifu_pdf_reporter import (
+                from ifu_verifier.ifu_pdf_reporter import (
                     build_ifu_report, IFUVerificationResult)
 
                 ifu_path = self._ifu_path.get()
