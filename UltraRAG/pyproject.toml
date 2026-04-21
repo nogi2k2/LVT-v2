@@ -1,0 +1,94 @@
+[build-system]
+requires = ["setuptools>=82.0.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ultrarag"
+version = "0.3.0.2"
+description = "UltraRAG"
+readme = "README.md"
+requires-python = ">=3.11, <3.13"
+dependencies = [
+    "fastmcp==3.2.4",
+    "mcp",
+    "rich",
+    "pandas",
+    "Jinja2",
+    "openai",
+    "httpx[socks]",
+    "python-dotenv",
+    "PyYAML",
+    "tqdm",
+    "requests",
+    "orjson",
+    "tabulate",
+    "aiohttp",
+    "pillow",
+    "flask",
+    "numpy",
+    "fakeredis",
+    "pymilvus",
+    "pypinyin",
+    "charset-normalizer",
+    "python-docx",
+    "pymupdf",
+    "chonkie",
+    "tiktoken",
+]
+
+[project.optional-dependencies]
+retriever = [
+    "infinity-emb",
+    "sentence-transformers",
+    "openai",
+    "bm25s",
+    "faiss-gpu-cu12",
+    "exa_py",
+    "tavily-python",
+    "pymilvus",
+    "numba",
+    "torch",
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+]
+
+generation = [
+    "vllm>=0.19.0",
+    "openai",
+    "transformers",
+    "torch",
+]
+
+evaluation = [
+    "rouge-score",
+    "pytrec-eval-terrier",
+]
+
+corpus = [
+    "mineru[core]",
+]
+
+all = [
+    "ultrarag[retriever]",
+    "ultrarag[generation]",
+    "ultrarag[corpus]",
+    "ultrarag[evaluation]",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+ultrarag = "ultrarag.client:main"
+
+[dependency-groups]
+dev = [
+    "ruff",
+    "ipython",
+    "jupyter",
+    "pytest",
+]
+
+[tool.uv]
+package = true

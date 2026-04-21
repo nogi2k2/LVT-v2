@@ -1,0 +1,19 @@
+# RAG Demo for UltraRAG UI
+
+# MCP Server
+servers:
+  benchmark: servers/benchmark
+  retriever: servers/retriever
+  prompt: servers/prompt
+  generation: servers/generation
+  custom: servers/custom
+
+# MCP Client Pipeline
+pipeline:
+- benchmark.get_data
+- retriever.retriever_init
+- generation.generation_init
+- retriever.retriever_search
+- custom.assign_citation_ids
+- prompt.qa_rag_boxed
+- generation.generate

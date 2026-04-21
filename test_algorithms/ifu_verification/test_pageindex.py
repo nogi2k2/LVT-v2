@@ -202,15 +202,15 @@ def _write_comparison_log(output_dir: Path, payload: dict) -> Path:
         f"Selection reason: {pageindex['selection_reason']}",
         f"Sections: {', '.join(pageindex['sections']) if pageindex['sections'] else '-'}",
         "",
-        "PageIndex evidence bullets:",
+        "PageIndex evidence:",
     ])
 
-    evidence = pageindex.get("evidence", [])
+    evidence = pageindex.get("supporting_chunks", [])
     if evidence:
         for item in evidence:
             lines.append(f"  - {item}")
     else:
-        lines.append("  - No evidence bullets returned.")
+        lines.append("  - No verbatim supporting evidence returned.")
 
     lines.extend([
         "",
@@ -407,7 +407,6 @@ Return JSON only:
 {{
   "status": "PASS" | "FAIL" | "UNKNOWN",
   "verdict": "short verdict sentence",
-  "evidence": ["short bullet evidence 1", "short bullet evidence 2"],
     "supporting_chunks": ["verbatim supporting text copied from the page content", "second verbatim supporting text if needed"],
   "missing": ["missing detail if any"],
   "pages_used": "same or narrower pages string"
@@ -470,7 +469,7 @@ def _run_single_test(
     print(f"Pages: {pageindex_result.get('selected_pages', '-')}")
     print(f"Reason: {pageindex_result.get('selection_reason', '-')}")
 
-    evidence = pageindex_result.get("evidence", [])
+    evidence = pageindex_result.get("supporting_chunks", [])
     if evidence:
         print("\n[Evidence]")
         for item in evidence:
@@ -506,7 +505,7 @@ def _run_single_test(
             "pages_used": pageindex_result.get("pages_used", "-"),
             "selection_reason": pageindex_result.get("selection_reason", "-"),
             "sections": pageindex_result.get("sections", []),
-            "evidence": pageindex_result.get("evidence", []),
+            "evidence": pageindex_result.get("supporting_chunks", []),
             "supporting_chunks": pageindex_result.get("supporting_chunks", []),
             "page_text_blobs": pageindex_result.get("page_text_blobs", []),
             "missing": pageindex_result.get("missing", []),
