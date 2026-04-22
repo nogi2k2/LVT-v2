@@ -5,7 +5,9 @@ import importlib
 import json
 import os
 import sys
+import threading
 import time
+import traceback
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -54,10 +56,167 @@ from test_algorithms.ifu_verification.benchmark_helpers import (
 )
 
 PageIndexClient = importlib.import_module("pageindex").PageIndexClient
-page_index = importlib.import_module("pageindex.page_index").page_index
+page_index_module = importlib.import_module("pageindex.page_index")
+page_index = page_index_module.page_index
 extract_json = importlib.import_module("pageindex.utils").extract_json
 
 litellm.drop_params = True
+
+
+class ProgressTracker:
+    def __init__(self, run_dir: Path) -> None:
+        self.run_dir = run_dir
+        self.progress_log_path = run_dir / "progress.log"
+        self.status_path = run_dir / "status.json"
+        self.failure_path = run_dir / "failure.json"
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self.state: dict[str, Any] = {
+            "state": "starting",
+            "stage": "init",
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "llm_call_count": 0,
+            "last_llm_started_at": None,
+            "last_llm_finished_at": None,
+            "last_message": "Benchmark created.",
+        }
+        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._write_status()
+        self._log_line("[Init] Progress tracker created.")
+        self._heartbeat_thread.start()
+
+    def _timestamp(self) -> str:
+        return datetime.now().isoformat(timespec="seconds")
+
+    def _log_line(self, message: str) -> None:
+        line = f"[{self._timestamp()}] {message}"
+        print(line, flush=True)
+        with open(self.progress_log_path, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+
+    def _write_status(self) -> None:
+        self.state["updated_at"] = self._timestamp()
+        self.status_path.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def set_stage(self, stage: str, message: str, **extra: Any) -> None:
+        with self._lock:
+            self.state["stage"] = stage
+            self.state["last_message"] = message
+            self.state.update(extra)
+            self._write_status()
+        self._log_line(f"[{stage}] {message}")
+
+    def record_llm_start(self, label: str) -> int:
+        with self._lock:
+            self.state["llm_call_count"] = int(self.state.get("llm_call_count", 0)) + 1
+            call_id = self.state["llm_call_count"]
+            self.state["last_llm_started_at"] = self._timestamp()
+            self.state["last_message"] = f"LLM call {call_id} started: {label}"
+            self._write_status()
+        self._log_line(f"[LLM {call_id:03d} START] {label}")
+        return call_id
+
+    def record_llm_end(self, call_id: int, label: str, seconds: float, *, error: str | None = None) -> None:
+        with self._lock:
+            self.state["last_llm_finished_at"] = self._timestamp()
+            if error:
+                self.state["last_message"] = f"LLM call {call_id} failed: {label}"
+            else:
+                self.state["last_message"] = f"LLM call {call_id} finished: {label}"
+            self._write_status()
+        if error:
+            self._log_line(f"[LLM {call_id:03d} ERROR] {label} after {seconds:.2f}s | {error}")
+        else:
+            self._log_line(f"[LLM {call_id:03d} DONE] {label} in {seconds:.2f}s")
+
+    def write_failure(self, exc: BaseException) -> None:
+        payload = {
+            "timestamp": self._timestamp(),
+            "stage": self.state.get("stage"),
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        self.failure_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.set_stage("failed", f"Run failed: {exc}", state="failed")
+
+    def finish(self, message: str) -> None:
+        with self._lock:
+            self.state["state"] = "completed"
+            self.state["last_message"] = message
+            self._write_status()
+        self._log_line(f"[Done] {message}")
+        self._stop_event.set()
+
+    def close(self) -> None:
+        self._stop_event.set()
+
+    def _heartbeat_loop(self) -> None:
+        while not self._stop_event.wait(30):
+            with self._lock:
+                stage = self.state.get("stage", "unknown")
+                llm_calls = self.state.get("llm_call_count", 0)
+                message = self.state.get("last_message", "")
+            self._log_line(f"[Heartbeat] stage={stage} llm_calls={llm_calls} note={message}")
+
+
+def _classify_llm_prompt(prompt: str) -> str:
+    head = " ".join((prompt or "").split())[:220].lower()
+    if "detect if there is a table of content" in head:
+        return "toc_detection"
+    if "transform the whole table of content into a json" in head:
+        return "toc_transform"
+    if "add the physical_index to the table of contents" in head:
+        return "toc_physical_index_map"
+    if "check if the current section starts" in head:
+        return "section_start_check"
+    if "pick the 1 to 3 tightest page ranges" in head:
+        return "requirement_page_selection"
+    if "you are verifying whether an ifu satisfies a requirement" in head:
+        return "requirement_verification"
+    if "generate a concise summary" in head or "summary" in head:
+        return "summary_generation"
+    return summarize_text(head, 100) or "unknown_llm_call"
+
+
+def _install_pageindex_llm_tracing(progress: ProgressTracker) -> tuple[Any, Any]:
+    original_sync = page_index_module.llm_completion
+    original_async = page_index_module.llm_acompletion
+
+    def traced_sync(*args, **kwargs):
+        prompt = kwargs.get("prompt") or (args[1] if len(args) > 1 else "")
+        label = _classify_llm_prompt(prompt)
+        call_id = progress.record_llm_start(label)
+        started = time.time()
+        try:
+            result = original_sync(*args, **kwargs)
+            progress.record_llm_end(call_id, label, time.time() - started)
+            return result
+        except Exception as exc:
+            progress.record_llm_end(call_id, label, time.time() - started, error=str(exc))
+            raise
+
+    async def traced_async(*args, **kwargs):
+        prompt = kwargs.get("prompt") or (args[1] if len(args) > 1 else "")
+        label = _classify_llm_prompt(prompt)
+        call_id = progress.record_llm_start(label)
+        started = time.time()
+        try:
+            result = await original_async(*args, **kwargs)
+            progress.record_llm_end(call_id, label, time.time() - started)
+            return result
+        except Exception as exc:
+            progress.record_llm_end(call_id, label, time.time() - started, error=str(exc))
+            raise
+
+    page_index_module.llm_completion = traced_sync
+    page_index_module.llm_acompletion = traced_async
+    return original_sync, original_async
+
+
+def _restore_pageindex_llm_tracing(original_sync: Any, original_async: Any) -> None:
+    page_index_module.llm_completion = original_sync
+    page_index_module.llm_acompletion = original_async
 
 
 def _parse_args() -> argparse.Namespace:
@@ -148,19 +307,25 @@ def _find_cached_doc_id(client: Any, pdf_path: Path) -> str | None:
     return None
 
 
-def _index_pdf_with_toc(client: Any, pdf_path: Path, toc_scan_pages: int) -> dict[str, Any]:
+def _index_pdf_with_toc(client: Any, pdf_path: Path, toc_scan_pages: int, progress: ProgressTracker) -> dict[str, Any]:
     pages = _read_pdf_pages(pdf_path)
+    progress.set_stage("indexing", f"Starting fresh PageIndex build for {pdf_path.name}.", page_count=len(pages), toc_scan_pages=toc_scan_pages)
+    original_sync, original_async = _install_pageindex_llm_tracing(progress)
     started = time.time()
-    result = page_index(
-        doc=str(pdf_path),
-        model=client.model,
-        toc_check_page_num=toc_scan_pages,
-        if_add_node_summary="yes",
-        if_add_node_text="yes",
-        if_add_node_id="yes",
-        if_add_doc_description="yes",
-    )
+    try:
+        result = page_index(
+            doc=str(pdf_path),
+            model=client.model,
+            toc_check_page_num=toc_scan_pages,
+            if_add_node_summary="yes",
+            if_add_node_text="yes",
+            if_add_node_id="yes",
+            if_add_doc_description="yes",
+        )
+    finally:
+        _restore_pageindex_llm_tracing(original_sync, original_async)
     index_seconds = time.time() - started
+    progress.set_stage("indexing_complete", f"PageIndex build finished in {index_seconds:.2f}s.")
 
     doc_id = str(uuid.uuid4())
     client.documents[doc_id] = {
@@ -185,10 +350,11 @@ def _index_pdf_with_toc(client: Any, pdf_path: Path, toc_scan_pages: int) -> dic
     }
 
 
-def _get_or_index_doc(client: Any, pdf_path: Path, force_reindex: bool, toc_scan_pages: int) -> dict[str, Any]:
+def _get_or_index_doc(client: Any, pdf_path: Path, force_reindex: bool, toc_scan_pages: int, progress: ProgressTracker) -> dict[str, Any]:
     cached_doc_id = None if force_reindex else _find_cached_doc_id(client, pdf_path)
     if cached_doc_id:
         doc = client.documents.get(cached_doc_id, {})
+        progress.set_stage("index_cached", f"Using cached PageIndex document {cached_doc_id}.")
         return {
             "doc_id": cached_doc_id,
             "cached": True,
@@ -196,7 +362,7 @@ def _get_or_index_doc(client: Any, pdf_path: Path, force_reindex: bool, toc_scan
             "page_count": doc.get("page_count", 0),
             "doc_description": doc.get("doc_description", ""),
         }
-    return _index_pdf_with_toc(client, pdf_path, toc_scan_pages)
+    return _index_pdf_with_toc(client, pdf_path, toc_scan_pages, progress)
 
 
 def _select_relevant_pages(client: Any, doc_id: str, requirement: str, model: str) -> tuple[dict[str, Any], float]:
@@ -376,99 +542,135 @@ def main() -> int:
 
     requirements = load_requirements(requirements_path)
     run_dir = create_run_dir(output_root, "pageindex_trilogy", pdf_path)
-
-    print("=== PageIndex Trilogy Benchmark ===")
-    print(f"PDF: {pdf_path}")
-    print(f"Requirements: {requirements_path}")
-    print(f"Model: {args.model}")
-    print(f"Workspace: {workspace}")
-    print(f"Output dir: {run_dir}")
-
-    toc_probe = probe_toc_pages(pdf_path, max_pages=max(args.toc_scan_pages, 10))
-    print(f"TOC candidate pages: {toc_probe.get('page_numbers', [])}")
-    print(f"Detected TOC start page: {toc_probe.get('toc_start_page')}")
-
-    overall_started = time.time()
-    client_started = time.time()
-    client = PageIndexClient(model=args.model, retrieve_model=args.model, workspace=str(workspace))
-    client_init_seconds = time.time() - client_started
-
-    index_info = _get_or_index_doc(client, pdf_path, force_reindex=args.reindex, toc_scan_pages=args.toc_scan_pages)
-    doc_id = index_info['doc_id']
-    structure = json.loads(client.get_document_structure(doc_id))
-    top_sections = [node.get('title', '') for node in structure[:10] if node.get('title')]
-
-    print(f"Client init time: {client_init_seconds:.2f}s")
-    print(f"Index created this run: {not index_info['cached']}")
-    print(f"Index creation time: {index_info['index_seconds']:.2f}s")
-    print(f"Top-level sections: {', '.join(top_sections[:8]) if top_sections else '-'}")
-
-    results = []
-    for index, requirement in enumerate(requirements, start=1):
-        print(f"\n[{index:02d}/{len(requirements):02d}] Running requirement")
-        print(f"Requirement: {requirement}")
-        try:
-            result = _verify_requirement(client, doc_id, requirement, args.model)
-        except Exception as exc:
-            result = {
-                "status": "ERROR",
-                "verdict": f"Error: {exc}",
-                "supporting_chunks": [],
-                "missing": [],
-                "selected_pages": "-",
-                "pages_used": "-",
-                "selected_page_count": 0,
-                "pages_used_count": 0,
-                "selection_reason": "",
-                "sections": [],
-                "page_text_blobs": [],
-                "timings": {
-                    "selection_seconds": 0.0,
-                    "page_fetch_seconds": 0.0,
-                    "verification_seconds": 0.0,
-                    "total_seconds": 0.0,
-                },
-            }
-        result['index'] = index
-        result['requirement'] = requirement
-        results.append(result)
-        timings = result['timings']
-        print(
-            f"Result: {result['status']} | total={timings['total_seconds']:.2f}s | "
-            f"select={timings['selection_seconds']:.2f}s | fetch={timings['page_fetch_seconds']:.2f}s | "
-            f"verify={timings['verification_seconds']:.2f}s | pages={result['selected_pages']}"
-        )
-        print(f"Verdict: {result['verdict']}")
-        evidence = result.get('supporting_chunks', [])
-        if evidence:
-            print(f"Evidence: {evidence[0]}")
-
-    summary = {
-        "method": "PageIndex",
-        "run_timestamp": datetime.now().isoformat(timespec="seconds"),
-        "pdf_path": str(pdf_path),
-        "requirements_path": str(requirements_path),
-        "model": args.model,
-        "requirement_count": len(requirements),
-        "total_runtime_seconds": time.time() - overall_started,
-        "toc_probe": toc_probe,
-        "setup": {
-            "client_init_seconds": client_init_seconds,
-            "index_created": not index_info['cached'],
-            "index_seconds": index_info['index_seconds'],
-            "page_count": index_info['page_count'],
-            "doc_description": index_info.get('doc_description', ''),
-            "top_sections": top_sections,
+    progress = ProgressTracker(run_dir)
+    write_json(
+        run_dir / "run_config.json",
+        {
+            "pdf_path": str(pdf_path),
+            "requirements_path": str(requirements_path),
+            "model": args.model,
             "workspace": str(workspace),
             "toc_scan_pages": args.toc_scan_pages,
+            "reindex": args.reindex,
+            "requirement_count": len(requirements),
         },
-        "results": results,
-    }
+    )
 
-    write_json(run_dir / "run_summary.json", summary)
-    write_text(run_dir / "run_summary.txt", _build_text_report(summary))
-    print(f"\nSaved PageIndex benchmark logs to: {run_dir}")
-    return 0
+    try:
+        progress.set_stage("startup", "Benchmark starting.")
+        print("=== PageIndex Trilogy Benchmark ===")
+        print(f"PDF: {pdf_path}")
+        print(f"Requirements: {requirements_path}")
+        print(f"Model: {args.model}")
+        print(f"Workspace: {workspace}")
+        print(f"Output dir: {run_dir}")
+
+        toc_probe = probe_toc_pages(pdf_path, max_pages=max(args.toc_scan_pages, 10))
+        progress.set_stage("toc_probe", f"TOC candidate pages: {toc_probe.get('page_numbers', [])}")
+        print(f"TOC candidate pages: {toc_probe.get('page_numbers', [])}")
+        print(f"Detected TOC start page: {toc_probe.get('toc_start_page')}")
+
+        overall_started = time.time()
+        client_started = time.time()
+        client = PageIndexClient(model=args.model, retrieve_model=args.model, workspace=str(workspace))
+        client_init_seconds = time.time() - client_started
+        progress.set_stage("client_ready", f"PageIndex client initialized in {client_init_seconds:.2f}s.")
+
+        index_info = _get_or_index_doc(client, pdf_path, force_reindex=args.reindex, toc_scan_pages=args.toc_scan_pages, progress=progress)
+        doc_id = index_info['doc_id']
+        progress.set_stage("structure_load", f"Loading indexed structure for document {doc_id}.")
+        structure = json.loads(client.get_document_structure(doc_id))
+        top_sections = [node.get('title', '') for node in structure[:10] if node.get('title')]
+        write_json(
+            run_dir / "setup_snapshot.json",
+            {
+                "toc_probe": toc_probe,
+                "client_init_seconds": client_init_seconds,
+                "index_info": index_info,
+                "top_sections": top_sections,
+            },
+        )
+
+        print(f"Client init time: {client_init_seconds:.2f}s")
+        print(f"Index created this run: {not index_info['cached']}")
+        print(f"Index creation time: {index_info['index_seconds']:.2f}s")
+        print(f"Top-level sections: {', '.join(top_sections[:8]) if top_sections else '-'}")
+
+        results = []
+        for index, requirement in enumerate(requirements, start=1):
+            progress.set_stage("requirement", f"Running requirement {index}/{len(requirements)}.", requirement_index=index, current_requirement=requirement)
+            print(f"\n[{index:02d}/{len(requirements):02d}] Running requirement")
+            print(f"Requirement: {requirement}")
+            try:
+                result = _verify_requirement(client, doc_id, requirement, args.model)
+            except Exception as exc:
+                result = {
+                    "status": "ERROR",
+                    "verdict": f"Error: {exc}",
+                    "supporting_chunks": [],
+                    "missing": [],
+                    "selected_pages": "-",
+                    "pages_used": "-",
+                    "selected_page_count": 0,
+                    "pages_used_count": 0,
+                    "selection_reason": "",
+                    "sections": [],
+                    "page_text_blobs": [],
+                    "timings": {
+                        "selection_seconds": 0.0,
+                        "page_fetch_seconds": 0.0,
+                        "verification_seconds": 0.0,
+                        "total_seconds": 0.0,
+                    },
+                }
+            result['index'] = index
+            result['requirement'] = requirement
+            results.append(result)
+            write_json(run_dir / f"requirement_{index:02d}.json", result)
+            write_json(run_dir / "partial_results.json", {"results": results})
+            timings = result['timings']
+            print(
+                f"Result: {result['status']} | total={timings['total_seconds']:.2f}s | "
+                f"select={timings['selection_seconds']:.2f}s | fetch={timings['page_fetch_seconds']:.2f}s | "
+                f"verify={timings['verification_seconds']:.2f}s | pages={result['selected_pages']}"
+            )
+            print(f"Verdict: {result['verdict']}")
+            evidence = result.get('supporting_chunks', [])
+            if evidence:
+                print(f"Evidence: {evidence[0]}")
+
+        summary = {
+            "method": "PageIndex",
+            "run_timestamp": datetime.now().isoformat(timespec="seconds"),
+            "pdf_path": str(pdf_path),
+            "requirements_path": str(requirements_path),
+            "model": args.model,
+            "requirement_count": len(requirements),
+            "total_runtime_seconds": time.time() - overall_started,
+            "toc_probe": toc_probe,
+            "setup": {
+                "client_init_seconds": client_init_seconds,
+                "index_created": not index_info['cached'],
+                "index_seconds": index_info['index_seconds'],
+                "page_count": index_info['page_count'],
+                "doc_description": index_info.get('doc_description', ''),
+                "top_sections": top_sections,
+                "workspace": str(workspace),
+                "toc_scan_pages": args.toc_scan_pages,
+            },
+            "results": results,
+        }
+
+        write_json(run_dir / "run_summary.json", summary)
+        write_text(run_dir / "run_summary.txt", _build_text_report(summary))
+        progress.finish(f"Saved PageIndex benchmark logs to {run_dir}")
+        print(f"\nSaved PageIndex benchmark logs to: {run_dir}")
+        return 0
+    except Exception as exc:
+        progress.write_failure(exc)
+        raise
+    finally:
+        progress.close()
 
 
 if __name__ == "__main__":

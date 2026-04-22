@@ -7,6 +7,9 @@ from pathlib import Path
 from typing import Any
 
 import PyPDF2
+import threading
+import time
+import traceback
 
 
 def load_requirements(path: Path) -> list[str]:
@@ -137,3 +140,145 @@ def summarize_passage_for_terminal(passage: str, max_chars: int = 220) -> str:
     if len(content) > max_chars:
         preview += " ..."
     return f"{title}: {preview}"
+
+
+class ProgressTracker:
+    """Lightweight progress tracker that writes progress.log, status.json, and failure.json.
+
+    Methods:
+    - set_stage(stage, message, **extra)
+    - log_block(stage, lines, **extra)
+    - record_llm_start(label) -> call_id
+    - record_llm_end(call_id, label, seconds, error=None)
+    - write_failure(exc)
+    - finish(message)
+    - close()
+    """
+
+    def __init__(self, run_dir: Path) -> None:
+        self.run_dir = run_dir
+        self.progress_log_path = run_dir / "progress.log"
+        self.status_path = run_dir / "status.json"
+        self.failure_path = run_dir / "failure.json"
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self.state: dict[str, Any] = {
+            "state": "starting",
+            "stage": "init",
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "llm_call_count": 0,
+            "last_llm_started_at": None,
+            "last_llm_finished_at": None,
+            "last_message": "Benchmark created.",
+        }
+        self._last_logged_state = self.state["state"]
+        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._write_status()
+        self._log_line("[Init] Progress tracker created.")
+        self._log_line(f"[State] {self.state['state']} | stage={self.state['stage']}")
+        self._heartbeat_thread.start()
+
+    def _timestamp(self) -> str:
+        return datetime.now().isoformat(timespec="seconds")
+
+    def _log_line(self, message: str) -> None:
+        line = f"[{self._timestamp()}] {message}"
+        print(line, flush=True)
+        with open(self.progress_log_path, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+
+    def _write_status(self) -> None:
+        self.state["updated_at"] = self._timestamp()
+        self.status_path.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _log_state_if_changed(self) -> None:
+        current_state = str(self.state.get("state", "unknown"))
+        if current_state != self._last_logged_state:
+            self._last_logged_state = current_state
+            self._log_line(f"[State] {current_state} | stage={self.state.get('stage', 'unknown')}")
+
+    def set_stage(self, stage: str, message: str, **extra: Any) -> None:
+        with self._lock:
+            if "state" not in extra and self.state.get("state") == "starting":
+                self.state["state"] = "running"
+            self.state["stage"] = stage
+            self.state["last_message"] = message
+            self.state.update(extra)
+            self._write_status()
+            self._log_state_if_changed()
+        self._log_line(f"[{stage}] {message}")
+
+    def log_block(self, stage: str, lines: list[str], **extra: Any) -> None:
+        message = lines[0] if lines else ""
+        with self._lock:
+            if "state" not in extra and self.state.get("state") == "starting":
+                self.state["state"] = "running"
+            self.state["stage"] = stage
+            self.state["last_message"] = message
+            self.state.update(extra)
+            self._write_status()
+            self._log_state_if_changed()
+        if not lines:
+            self._log_line(f"[{stage}]")
+            return
+        self._log_line(f"[{stage}] {lines[0]}")
+        for line in lines[1:]:
+            self._log_line(f"[detail] {line}")
+
+    def record_llm_start(self, label: str) -> int:
+        with self._lock:
+            if self.state.get("state") == "starting":
+                self.state["state"] = "running"
+            self.state["llm_call_count"] = int(self.state.get("llm_call_count", 0)) + 1
+            call_id = self.state["llm_call_count"]
+            self.state["last_llm_started_at"] = self._timestamp()
+            self.state["last_message"] = f"LLM call {call_id} started: {label}"
+            self._write_status()
+            self._log_state_if_changed()
+        self._log_line(f"[LLM {call_id:03d} START] {label}")
+        return call_id
+
+    def record_llm_end(self, call_id: int, label: str, seconds: float, *, error: str | None = None) -> None:
+        with self._lock:
+            self.state["last_llm_finished_at"] = self._timestamp()
+            if error:
+                self.state["last_message"] = f"LLM call {call_id} failed: {label}"
+            else:
+                self.state["last_message"] = f"LLM call {call_id} finished: {label}"
+            self._write_status()
+        if error:
+            self._log_line(f"[LLM {call_id:03d} ERROR] {label} after {seconds:.2f}s | {error}")
+        else:
+            self._log_line(f"[LLM {call_id:03d} DONE] {label} in {seconds:.2f}s")
+
+    def write_failure(self, exc: BaseException) -> None:
+        payload = {
+            "timestamp": self._timestamp(),
+            "stage": self.state.get("stage"),
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        self.failure_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.set_stage("failed", f"Run failed: {exc}", state="failed")
+
+    def finish(self, message: str) -> None:
+        with self._lock:
+            self.state["state"] = "completed"
+            self.state["last_message"] = message
+            self._write_status()
+            self._log_state_if_changed()
+        self._log_line(f"[Done] {message}")
+        self._stop_event.set()
+
+    def close(self) -> None:
+        self._stop_event.set()
+
+    def _heartbeat_loop(self) -> None:
+        while not self._stop_event.wait(30):
+            with self._lock:
+                state = self.state.get("state", "unknown")
+                stage = self.state.get("stage", "unknown")
+                llm_calls = self.state.get("llm_call_count", 0)
+                message = self.state.get("last_message", "")
+            self._log_line(f"[Heartbeat] state={state} stage={stage} llm_calls={llm_calls} note={message}")

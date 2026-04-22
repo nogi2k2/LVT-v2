@@ -54,6 +54,7 @@ from test_algorithms.ifu_verification.benchmark_helpers import (
     write_json,
     write_text,
 )
+from test_algorithms.ifu_verification.benchmark_helpers import ProgressTracker
 
 _ultrarag_api = importlib.import_module("ultrarag.api")
 ToolCall = _ultrarag_api.ToolCall
@@ -170,6 +171,7 @@ Return JSON only:
   "notes": "very short explanation"
 }}
 """
+    # perform the LLM call; caller may have a ProgressTracker in scope and set stages
     started = time.time()
     response = litellm.completion(
         model=_normalize_ollama_model(model),
@@ -397,6 +399,22 @@ def main() -> int:
 
     requirements = load_requirements(requirements_path)
     run_dir = create_run_dir(output_root, "ultrarag_trilogy_mcp", pdf_path)
+    progress = ProgressTracker(run_dir)
+    write_json(
+        run_dir / "run_config.json",
+        {
+            "pdf_path": str(pdf_path),
+            "requirements_path": str(requirements_path),
+            "model": args.model,
+            "embed_model": args.embed_model,
+            "backend": args.backend,
+            "top_k": args.top_k,
+            "chunk_size": args.chunk_size,
+            "chunk_overlap": args.chunk_overlap,
+            "force_rebuild": args.force_rebuild,
+            "requirement_count": len(requirements),
+        },
+    )
 
     print("=== UltraRAG Trilogy Benchmark (MCP) ===")
     print(f"PDF: {pdf_path}")
@@ -405,98 +423,125 @@ def main() -> int:
     print(f"Embedding model: {args.embed_model}")
     print(f"Output dir: {run_dir}")
 
-    overall_started = time.time()
-    ingest_info = _ingest_ifu(
-        pdf_path,
-        output_root,
-        embed_model=args.embed_model,
-        force_rebuild=args.force_rebuild,
-        backend=args.backend,
-        chunk_size=args.chunk_size,
-        chunk_overlap=args.chunk_overlap,
-    )
+    try:
+        overall_started = time.time()
+        progress.set_stage("ingest", "Starting UltraRAG ingestion and index build.")
+        ingest_info = _ingest_ifu(
+            pdf_path,
+            output_root,
+            embed_model=args.embed_model,
+            force_rebuild=args.force_rebuild,
+            backend=args.backend,
+            chunk_size=args.chunk_size,
+            chunk_overlap=args.chunk_overlap,
+        )
+        progress.set_stage("ingest_complete", "Ingestion complete.", **{"stage_timings": ingest_info.get("stage_timings", {})})
 
     print(f"Resolved embedding model path: {ingest_info['resolved_embed_model']}")
     for key, value in ingest_info['stage_timings'].items():
         print(f"{key}: {value:.2f}s")
 
-    results = []
-    for index, requirement in enumerate(requirements, start=1):
-        print(f"\n[{index:02d}/{len(requirements):02d}] Running requirement")
-        print(f"Requirement: {requirement}")
+        results = []
+        for index, requirement in enumerate(requirements, start=1):
+            progress.set_stage("requirement", f"Running requirement {index}/{len(requirements)}.", requirement_index=index, current_requirement=requirement)
+            print(f"\n[{index:02d}/{len(requirements):02d}] Running requirement")
+            print(f"Requirement: {requirement}")
+            try:
+                progress.set_stage("retrieval", f"Retrieving top-{args.top_k} passages for requirement {index}.")
+                passages, retrieval_seconds = _retrieve(requirement, args.top_k)
+
+                # trace LLM verification call
+                call_id = progress.record_llm_start("requirement_verification")
+                verdict, verification_seconds, prepared_passages = _verify_with_ollama(requirement, passages, args.model)
+                progress.record_llm_end(call_id, "requirement_verification", verification_seconds)
+
+                result = {
+                    "index": index,
+                    "requirement": requirement,
+                    "status": verdict.get('status', 'UNKNOWN'),
+                    "verdict": verdict.get('verdict', ''),
+                    "supporting_chunks": verdict.get('supporting_chunks', []),
+                    "missing": verdict.get('missing', []),
+                    "notes": verdict.get('notes', ''),
+                    "retrieval_seconds": retrieval_seconds,
+                    "verification_seconds": verification_seconds,
+                    "total_seconds": retrieval_seconds + verification_seconds,
+                    "retrieved_chunk_count": len(prepared_passages),
+                    "retrieved_char_count": sum(len(item) for item in prepared_passages),
+                    "retrieved_passages": prepared_passages,
+                    "retrieved_passage_previews": [summarize_passage_for_terminal(item) for item in prepared_passages],
+                }
+            except Exception as exc:
+                progress.set_stage("requirement_error", f"Requirement {index} failed: {exc}")
+                result = {
+                    "index": index,
+                    "requirement": requirement,
+                    "status": "ERROR",
+                    "verdict": f"Error: {exc}",
+                    "supporting_chunks": [],
+                    "missing": [],
+                    "notes": "",
+                    "retrieval_seconds": 0.0,
+                    "verification_seconds": 0.0,
+                    "total_seconds": 0.0,
+                    "retrieved_chunk_count": 0,
+                    "retrieved_char_count": 0,
+                    "retrieved_passages": [],
+                    "retrieved_passage_previews": [],
+                }
+            results.append(result)
+            write_json(run_dir / f"requirement_{index:02d}.json", result)
+            write_json(run_dir / "partial_results.json", {"results": results})
+            print(
+                f"Result: {result['status']} | total={result['total_seconds']:.2f}s | retrieve={result['retrieval_seconds']:.2f}s | "
+                f"verify={result['verification_seconds']:.2f}s | chunks={result['retrieved_chunk_count']} | chars={result['retrieved_char_count']}"
+            )
+            print(f"Verdict: {result['verdict']}")
+            evidence = result.get('supporting_chunks', [])
+            if evidence:
+                print(f"Evidence: {evidence[0]}")
+
+        summary = {
+            "method": "UltraRAG MCP",
+            "run_timestamp": datetime.now().isoformat(timespec="seconds"),
+            "pdf_path": str(pdf_path),
+            "requirements_path": str(requirements_path),
+            "model": args.model,
+            "backend": args.backend,
+            "embed_model": args.embed_model,
+            "resolved_embed_model": ingest_info['resolved_embed_model'],
+            "requirement_count": len(requirements),
+            "total_runtime_seconds": time.time() - overall_started,
+            "setup": {
+                "stage_timings": ingest_info['stage_timings'],
+                "cache_hits": ingest_info['cache_hits'],
+                "chunk_path": ingest_info['chunk_path'],
+                "chunk_size": args.chunk_size,
+                "chunk_overlap": args.chunk_overlap,
+                "top_k": args.top_k,
+                "artifact_dir": str(ingest_info['work_dir']),
+            },
+            "results": results,
+        }
+
+        write_json(run_dir / "run_summary.json", summary)
+        write_text(run_dir / "run_summary.txt", _build_text_report(summary))
+        progress.finish(f"Saved UltraRAG benchmark logs to {run_dir}")
+        print(f"\nSaved UltraRAG benchmark logs to: {run_dir}")
+        return 0
+    except Exception as exc:
+        # record failure and re-raise so exit code is non-zero
         try:
-            passages, retrieval_seconds = _retrieve(requirement, args.top_k)
-            verdict, verification_seconds, prepared_passages = _verify_with_ollama(requirement, passages, args.model)
-            result = {
-                "index": index,
-                "requirement": requirement,
-                "status": verdict.get('status', 'UNKNOWN'),
-                "verdict": verdict.get('verdict', ''),
-                "supporting_chunks": verdict.get('supporting_chunks', []),
-                "missing": verdict.get('missing', []),
-                "notes": verdict.get('notes', ''),
-                "retrieval_seconds": retrieval_seconds,
-                "verification_seconds": verification_seconds,
-                "total_seconds": retrieval_seconds + verification_seconds,
-                "retrieved_chunk_count": len(prepared_passages),
-                "retrieved_char_count": sum(len(item) for item in prepared_passages),
-                "retrieved_passages": prepared_passages,
-                "retrieved_passage_previews": [summarize_passage_for_terminal(item) for item in prepared_passages],
-            }
-        except Exception as exc:
-            result = {
-                "index": index,
-                "requirement": requirement,
-                "status": "ERROR",
-                "verdict": f"Error: {exc}",
-                "supporting_chunks": [],
-                "missing": [],
-                "notes": "",
-                "retrieval_seconds": 0.0,
-                "verification_seconds": 0.0,
-                "total_seconds": 0.0,
-                "retrieved_chunk_count": 0,
-                "retrieved_char_count": 0,
-                "retrieved_passages": [],
-                "retrieved_passage_previews": [],
-            }
-        results.append(result)
-        print(
-            f"Result: {result['status']} | total={result['total_seconds']:.2f}s | retrieve={result['retrieval_seconds']:.2f}s | "
-            f"verify={result['verification_seconds']:.2f}s | chunks={result['retrieved_chunk_count']} | chars={result['retrieved_char_count']}"
-        )
-        print(f"Verdict: {result['verdict']}")
-        evidence = result.get('supporting_chunks', [])
-        if evidence:
-            print(f"Evidence: {evidence[0]}")
-
-    summary = {
-        "method": "UltraRAG MCP",
-        "run_timestamp": datetime.now().isoformat(timespec="seconds"),
-        "pdf_path": str(pdf_path),
-        "requirements_path": str(requirements_path),
-        "model": args.model,
-        "backend": args.backend,
-        "embed_model": args.embed_model,
-        "resolved_embed_model": ingest_info['resolved_embed_model'],
-        "requirement_count": len(requirements),
-        "total_runtime_seconds": time.time() - overall_started,
-        "setup": {
-            "stage_timings": ingest_info['stage_timings'],
-            "cache_hits": ingest_info['cache_hits'],
-            "chunk_path": ingest_info['chunk_path'],
-            "chunk_size": args.chunk_size,
-            "chunk_overlap": args.chunk_overlap,
-            "top_k": args.top_k,
-            "artifact_dir": str(ingest_info['work_dir']),
-        },
-        "results": results,
-    }
-
-    write_json(run_dir / "run_summary.json", summary)
-    write_text(run_dir / "run_summary.txt", _build_text_report(summary))
-    print(f"\nSaved UltraRAG benchmark logs to: {run_dir}")
-    return 0
+            progress.write_failure(exc)
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            progress.close()
+        except Exception:
+            pass
+    
 
 
 if __name__ == "__main__":
